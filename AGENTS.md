@@ -53,4 +53,4 @@ solid 的语言（法则 25）：bash 的**形状**而非方言，只有基本�
 
 ## 8. 文档权威顺序
 
-`laws/` 是当前法则；`laws/status-rollup.md` 说状态，`laws/window-ownership.md` 说窗口与所有权法则（1–20），两者与其他文件冲突时以它们为准。`proposals/` 里都是**未采纳**的东西，别当定案引用。
+`laws/` 是当前法则；`laws/status-rollup.md` 说状态，`laws/window-ownership.md` 说窗口与所有权法则（1–25），两者与其他文件冲突时以它们为准。`proposals/` 里都是**未采纳**的东西，别当定案引用。

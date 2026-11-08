@@ -8,7 +8,7 @@
 
 ```
 laws/
-  window-ownership.md      法则 1–20：窗口与所有权（当前设计的核心）
+  window-ownership.md      法则 1–25：窗口与所有权（当前设计的核心）
   status-rollup.md         四桶清单：已定 / 有据 / 我提出但未采纳 / 未定
   delta-reasoning.md       推理与证据：为什么是这个形状、各组件的来龙去脉
   group-decision-rules.md  法则：群组表决 13 条
