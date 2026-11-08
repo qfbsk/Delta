@@ -22,7 +22,18 @@ carried-semantics/
                            从 kite 继承的**语义**（不是代码）：控制字节、Ctrl+C、裸 exe 名解析
 tools/
   sync-from-memory.sh      把 Qoder 记忆条目同步进本目录：剥 frontmatter、重写相对链接
+crates/
+  delta-core/              控制平面：窗口、事件、群聊、模式、pin 计数、接管申请
+    src/laws.rs            每条测试以一个法则编号命名（24 条，全绿）
+  solid/                   我们的 shell：bash 的形状、只有基本内建、`$` `@` 保留
 ```
+
+## 代码现状（2026-11-08 开工第一次提交）
+
+- **已有**：`crates/delta-core`（法则 1–4、8–11、13–23 里能被机器检查的那部分）与 `crates/solid`（词法 + `cd pwd ls cp md`）。`cargo test` 32 条全绿。
+- **本期留空位的**：`record.rs` 只有 `Recorder` trait 与 `NullRecorder`，但**每个该记账的动作都有调用点**（法则 5 的两个"自动"）。数据库、git、备份、权限管理的实现以后再做。
+- **还没开始**：PTY/ConPTY 与 VT  emulation、chrome 的绘制、`miku`、群聊与 ACP host、外部程序的执行。
+- **不在这个仓库里的承诺**：`Recorder` 之外的持久化。没有记录层之前，"看不见删除"这类法则依赖的部分只是被搁着，不是被满足。
 
 读的顺序：`laws/status-rollup.md` → `laws/window-ownership.md` → 需要证据时进 `laws/delta-reasoning.md` 与 `references/`。
 
