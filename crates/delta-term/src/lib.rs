@@ -1,6 +1,6 @@
 //! **delta-term** —— 字节层。
 //!
-//! 这一层是 `laws/delta-reasoning.md` *First runnable proof* 说必须先跑通的那一段：
+//! 这一层是 `04-终端与部件.md` 与 `07-现在到哪了.md` 说必须先跑通的那一段：
 //! cmd / pwsh / vim 在分屏里、每个键与 IME 都对，之后才轮到 AI 层。
 //!
 //! **写这个 crate 的规矩（AGENTS.md 第 5 条）**：不自己发明实现，也不链接参考实现。
