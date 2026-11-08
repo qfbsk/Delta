@@ -1,0 +1,6 @@
+[package]
+name = "solid"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
