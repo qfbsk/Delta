@@ -22,14 +22,19 @@ carried-semantics/
                            从 kite 继承的**语义**（不是代码）：控制字节、Ctrl+C、裸 exe 名解析
 tools/
   sync-from-memory.sh      把 Qoder 记忆条目同步进本目录：剥 frontmatter、重写相对链接
+vendor/
+  ghostty-1.4.0/           钉住的参考实现（只读，不是工作区成员，见 vendor/README.md）
+crates/
+  delta-term/              字节层：按文件转写 ghostty v1.4.0 的 Parser.zig / parse_table.zig / UTF8Decoder.zig
 ```
 
 ## 代码现状（2026-11-08）
 
-- **第一次尝试已按要求清空**（*"代码清空，记住看文档啊…先通读一下文档，在准备写"*）：`crates/delta-core` 与 `crates/solid` 连同 `Cargo.toml` 一并删掉。那一次的形状记在 `laws/status-rollup.md` 第 60 条，作为历史而不是现状。
-- **重来的顺序由文档决定，不由我挑**：`laws/delta-reasoning.md` 的 *First runnable proof* 段 —— *"before any agent exists, cmd / pwsh / vim must run in tabs and splits with every key combination and IME working"*，以及 `laws/status-rollup.md` 第 28 条（conformance 与 IME 是**地板**）。所以第一块是字节层，不是控制面。
-- **已有**：`crates/delta-term` —— 增量转义解析器（Ground/Escape/CSI/OSC，序列被拆成几次读也成立）、网格（自动换行按"最后一个字符才换行"、宽字符占两格、`CSI J/K`、CR/LF/BS/TAB）、scrollback 字节预算（`10000000`，与 herdr/ghostty 同一个数）。`cargo test` 17 条全绿。
-- **下一步（同一层内，按依赖）**：备用屏（1049/47/1047）——没有它跑不起 nvim；然后是 ConPTY host 与那条**还没测过**的输入保真度（`laws/window-ownership.md` 末尾的实测项）。
+- **第一次尝试已清空**（*"代码清空，记住看文档啊"*）：`delta-core` / `solid` 删掉，形状只留在 `laws/status-rollup.md` 第 60 条作为历史。
+- **写代码的规矩是"一边抄一边转写"**，不是我照着记忆重写：参考实现钉在 [vendor/ghostty-1.4.0](file:///E:/Delta/vendor/README.md)（git tag `v1.4.0`），逐文件对照，**连它自带的测试一起翻译**。参考不是依赖，不会被链接。
+- **已转写**（[crates/delta-term](file:///E:/Delta/crates/delta-term/src/lib.rs)）：`Parser.zig` → `parser.rs`（DEC ANSI 状态机、`next()` 三动作、`;`/`:` 分隔符只在 `m` 上允许）、`parse_table.zig` → `parse_table.rs`（256×14 转换表）、`UTF8Decoder.zig` → `utf8.rs`（DFA，出错替换且不吞字节）。`cargo test` 13 条，全部来自上游测试。
+- **还没转写，宁可空着**：`stream.zig`（字节走 UTF-8 还是走解析器的判定）、`osc.zig`（OSC 命令类型）、`Page.zig` / `Screen.zig`（格子与屏幕）。没有它们就不手写替代品。
+- **顺序仍由文档定**：字节层 → cmd/pwsh/vim 在分屏里跑通、每个键与 IME 都对（`laws/delta-reasoning.md` *First runnable proof*）→ 才轮到窗口管理与 AI 层。ConPTY 输入保真度那条实测项仍挂在 `laws/window-ownership.md` 末尾。
 
 读的顺序：`laws/status-rollup.md` → `laws/window-ownership.md` → 需要证据时进 `laws/delta-reasoning.md` 与 `references/`。
 
