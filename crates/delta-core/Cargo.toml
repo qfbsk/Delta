@@ -1,6 +1,0 @@
-[package]
-name = "delta-core"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]

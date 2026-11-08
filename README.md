@@ -22,18 +22,14 @@ carried-semantics/
                            从 kite 继承的**语义**（不是代码）：控制字节、Ctrl+C、裸 exe 名解析
 tools/
   sync-from-memory.sh      把 Qoder 记忆条目同步进本目录：剥 frontmatter、重写相对链接
-crates/
-  delta-core/              控制平面：窗口、事件、群聊、模式、pin 计数、接管申请
-    src/laws.rs            每条测试以一个法则编号命名（24 条，全绿）
-  solid/                   我们的 shell：bash 的形状、只有基本内建、`$` `@` 保留
 ```
 
-## 代码现状（2026-11-08 开工第一次提交）
+## 代码现状（2026-11-08）
 
-- **已有**：`crates/delta-core`（法则 1–4、8–11、13–23 里能被机器检查的那部分）与 `crates/solid`（词法 + `cd pwd ls cp md`）。`cargo test` 32 条全绿。
-- **本期留空位的**：`record.rs` 只有 `Recorder` trait 与 `NullRecorder`，但**每个该记账的动作都有调用点**（法则 5 的两个"自动"）。数据库、git、备份、权限管理的实现以后再做。
-- **还没开始**：PTY/ConPTY 与 VT  emulation、chrome 的绘制、`miku`、群聊与 ACP host、外部程序的执行。
-- **不在这个仓库里的承诺**：`Recorder` 之外的持久化。没有记录层之前，"看不见删除"这类法则依赖的部分只是被搁着，不是被满足。
+- **第一次尝试已按要求清空**（*"代码清空，记住看文档啊…先通读一下文档，在准备写"*）：`crates/delta-core` 与 `crates/solid` 连同 `Cargo.toml` 一并删掉。那一次的形状记在 `laws/status-rollup.md` 第 60 条，作为历史而不是现状。
+- **重来的顺序由文档决定，不由我挑**：`laws/delta-reasoning.md` 的 *First runnable proof* 段 —— *"before any agent exists, cmd / pwsh / vim must run in tabs and splits with every key combination and IME working"*，以及 `laws/status-rollup.md` 第 28 条（conformance 与 IME 是**地板**）。所以第一块是字节层，不是控制面。
+- **已有**：`crates/delta-term` —— 增量转义解析器（Ground/Escape/CSI/OSC，序列被拆成几次读也成立）、网格（自动换行按"最后一个字符才换行"、宽字符占两格、`CSI J/K`、CR/LF/BS/TAB）、scrollback 字节预算（`10000000`，与 herdr/ghostty 同一个数）。`cargo test` 17 条全绿。
+- **下一步（同一层内，按依赖）**：备用屏（1049/47/1047）——没有它跑不起 nvim；然后是 ConPTY host 与那条**还没测过**的输入保真度（`laws/window-ownership.md` 末尾的实测项）。
 
 读的顺序：`laws/status-rollup.md` → `laws/window-ownership.md` → 需要证据时进 `laws/delta-reasoning.md` 与 `references/`。
 

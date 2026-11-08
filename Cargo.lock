@@ -3,9 +3,5 @@
 version = 4
 
 [[package]]
-name = "delta-core"
-version = "0.0.0"
-
-[[package]]
-name = "solid"
+name = "delta-term"
 version = "0.0.0"
