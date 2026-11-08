@@ -1,7 +1,0 @@
-[workspace]
-resolver = "2"
-members = ["crates/delta-term"]
-
-[workspace.package]
-version = "0.0.0"
-edition = "2024"

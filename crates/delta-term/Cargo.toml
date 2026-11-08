@@ -1,6 +1,0 @@
-[package]
-name = "delta-term"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]
