@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/delta-term", "crates/delta-odd"]
+resolver = "2"
