@@ -1,37 +1,30 @@
+mod app;
+mod canvas;
 mod even;
-mod keys;
+mod input;
 mod layout;
+mod mcp;
 mod opencode;
-mod ownership;
-mod pane;
 mod pty;
-mod record;
 mod solid;
-mod tab;
 mod term;
-mod theme;
-mod vt;
-mod win;
+
+use std::path::PathBuf;
 
 fn main() {
-	let args: Vec<String> = std::env::args().skip(1).collect();
-	if args.iter().any(|a| a == "--smoke") {
-		if let Err(err) = pty::smoke() {
-			eprintln!("smoke: {err}");
-			std::process::exit(1);
+	let mut shell = None;
+	let mut file = None;
+	let mut args = std::env::args().skip(1);
+	while let Some(arg) = args.next() {
+		match arg.as_str() {
+			"--shell" => shell = args.next(),
+			"--file" => file = args.next().map(PathBuf::from),
+			other => {
+				if file.is_none() {
+					file = Some(PathBuf::from(other));
+				}
+			}
 		}
-		return;
 	}
-	let value = |name: &str| {
-		args.windows(2)
-			.find(|pair| pair[0] == name)
-			.map(|pair| pair[1].clone())
-	};
-	let shell = value("--shell");
-	let image = value("--image");
-	let file = value("--file");
-	if let Err(err) = win::run(shell, image, file) {
-		eprintln!("delta-term: {err}");
-		std::process::exit(1);
-	}
+	std::process::exit(app::run(shell, file));
 }

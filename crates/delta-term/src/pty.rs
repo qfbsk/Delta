@@ -1,29 +1,42 @@
+//! ConPTY host. The API shape and the process-attribute setup are transcribed
+//! from wezterm 20240203 (`pty/src/win/psuedocon.rs`) and the first Sony-era
+//! probe of kernel32 ConPTY documented in 第一代/02-有据.md.
+
 use std::ffi::c_void;
 use std::io;
 use std::mem::{size_of, transmute, zeroed};
 use std::ptr::null_mut;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use windows_sys::Win32::Foundation::{
-	CloseHandle, FARPROC, HANDLE, HANDLE_FLAG_INHERIT, HMODULE, SetHandleInformation,
+	CloseHandle, FARPROC, HANDLE, HANDLE_FLAG_INHERIT, HMODULE, INVALID_HANDLE_VALUE,
+	SetHandleInformation,
 };
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
-use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
+use windows_sys::Win32::Storage::FileSystem::{WriteFile, PIPE_ACCESS_OUTBOUND};
 use windows_sys::Win32::System::Console::{COORD, HPCON};
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
-use windows_sys::Win32::System::Pipes::CreatePipe;
+use windows_sys::Win32::System::Pipes::{
+	CreateNamedPipeW, CreatePipe, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
+};
 use windows_sys::Win32::System::Threading::{
 	CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
-	EXTENDED_STARTUPINFO_PRESENT, InitializeProcThreadAttributeList,
+	EXTENDED_STARTUPINFO_PRESENT, GetProcessId, InitializeProcThreadAttributeList,
 	LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION,
-	STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
+	STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
 };
+
+// Values from wezterm 20240203 `pty/src/win/psuedocon.rs`.
+const PSEUDOCONSOLE_RESIZE_QUIRK: u32 = 0x2;
+
+static CTRL_PIPE_SEQ: AtomicU32 = AtomicU32::new(0);
 
 pub struct ConPty {
 	hpc: HPCON,
 	input_write: HANDLE,
 	output_read: HANDLE,
-	input_read: HANDLE,
-	output_write: HANDLE,
+	ctrl_write: HANDLE,
 	process: HANDLE,
 	closed: bool,
 }
@@ -65,19 +78,24 @@ impl ConPty {
 			let _ = SetHandleInformation(input_write, HANDLE_FLAG_INHERIT, 0);
 			let _ = SetHandleInformation(output_read, HANDLE_FLAG_INHERIT, 0);
 
-			let mut hpc: HPCON = 0;
-			let api = conpty_api();
-			let hr = (api.create)(
-				COORD {
-					X: cols.max(1) as i16,
-					Y: rows.max(1) as i16,
-				},
-				input_read,
-				output_write,
-				10,
-				&mut hpc,
+			let ctrl_name = format!(
+				"\\\\.\\pipe\\delta-ctrl-{}-{}",
+				std::process::id(),
+				CTRL_PIPE_SEQ.fetch_add(1, Ordering::Relaxed)
 			);
-			if hr < 0 {
+			let mut ctrl_wide: Vec<u16> = ctrl_name.encode_utf16().collect();
+			ctrl_wide.push(0);
+			let ctrl_write = CreateNamedPipeW(
+				ctrl_wide.as_ptr(),
+				PIPE_ACCESS_OUTBOUND,
+				PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+				1,
+				64,
+				64,
+				0,
+				&sa,
+			);
+			if ctrl_write == INVALID_HANDLE_VALUE {
 				CloseHandle(input_read);
 				CloseHandle(input_write);
 				CloseHandle(output_read);
@@ -85,17 +103,39 @@ impl ConPty {
 				return Err(io::Error::last_os_error());
 			}
 
+			let mut hpc: HPCON = 0;
+			let api = conpty_api();
+			let create_flags = PSEUDOCONSOLE_RESIZE_QUIRK;
+			let hr = (api.create)(
+				COORD { X: cols.max(1) as i16, Y: rows.max(1) as i16 },
+				input_read,
+				output_write,
+				create_flags,
+				&mut hpc,
+			);
+			if hr < 0 {
+				CloseHandle(input_read);
+				CloseHandle(input_write);
+				CloseHandle(output_read);
+				CloseHandle(output_write);
+				CloseHandle(ctrl_write);
+				return Err(io::Error::last_os_error());
+			}
+			// The pseudoconsole owns its ends of both pipes. Keep our copies
+			// closed or the read side never sees EOF and teardown can stall.
+			CloseHandle(input_read);
+			CloseHandle(output_write);
+
 			let mut attr_size = 0usize;
 			let _ = InitializeProcThreadAttributeList(null_mut(), 1, 0, &mut attr_size);
 			let words = attr_size.div_ceil(size_of::<usize>()).max(1);
 			let mut attr_buf = vec![0usize; words];
 			let attr_list = attr_buf.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
 			if InitializeProcThreadAttributeList(attr_list, 1, 0, &mut attr_size) == 0 {
-				(conpty_api().close)(hpc);
-				CloseHandle(input_read);
+				(api.close)(hpc);
 				CloseHandle(input_write);
 				CloseHandle(output_read);
-				CloseHandle(output_write);
+				CloseHandle(ctrl_write);
 				return Err(io::Error::last_os_error());
 			}
 
@@ -110,18 +150,15 @@ impl ConPty {
 			) == 0
 			{
 				DeleteProcThreadAttributeList(attr_list);
-				(conpty_api().close)(hpc);
-				CloseHandle(input_read);
+				(api.close)(hpc);
 				CloseHandle(input_write);
 				CloseHandle(output_read);
-				CloseHandle(output_write);
+				CloseHandle(ctrl_write);
 				return Err(io::Error::last_os_error());
 			}
 
 			let mut si: STARTUPINFOEXW = zeroed();
 			si.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
-			// Keep the child from inheriting this process's redirected stdio.
-			// The pseudoconsole attribute supplies the console instead.
 			si.StartupInfo.dwFlags = 0x100; // STARTF_USESTDHANDLES
 			si.StartupInfo.hStdInput = usize::MAX as HANDLE;
 			si.StartupInfo.hStdOutput = usize::MAX as HANDLE;
@@ -131,13 +168,11 @@ impl ConPty {
 			let mut command: Vec<u16> = command.encode_utf16().collect();
 			command.push(0);
 
-			let env_block = environment_block(envs);
-			let mut flags = EXTENDED_STARTUPINFO_PRESENT;
-			let mut env_ptr: *const c_void = std::ptr::null();
-			if !envs.is_empty() {
-				flags |= CREATE_UNICODE_ENVIRONMENT;
-				env_ptr = env_block.as_ptr() as *const c_void;
-			}
+			let mut envs = envs.to_vec();
+			envs.push(("DELTA_CTRL".to_string(), ctrl_name.clone()));
+			let env_block = environment_block(&envs);
+			let flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT;
+			let env_ptr = env_block.as_ptr() as *const c_void;
 
 			let mut pi: PROCESS_INFORMATION = zeroed();
 			let ok = CreateProcessW(
@@ -156,11 +191,10 @@ impl ConPty {
 			DeleteProcThreadAttributeList(attr_list);
 
 			if ok == 0 {
-				(conpty_api().close)(hpc);
-				CloseHandle(input_read);
+				(api.close)(hpc);
 				CloseHandle(input_write);
 				CloseHandle(output_read);
-				CloseHandle(output_write);
+				CloseHandle(ctrl_write);
 				return Err(io::Error::last_os_error());
 			}
 
@@ -170,8 +204,7 @@ impl ConPty {
 				hpc,
 				input_write,
 				output_read,
-				input_read,
-				output_write,
+				ctrl_write,
 				process: pi.hProcess,
 				closed: false,
 			})
@@ -179,7 +212,7 @@ impl ConPty {
 	}
 
 	pub fn write(&self, bytes: &[u8]) {
-		if bytes.is_empty() {
+		if bytes.is_empty() || self.closed {
 			return;
 		}
 		let mut written = 0u32;
@@ -195,14 +228,33 @@ impl ConPty {
 	}
 
 	pub fn resize(&self, cols: usize, rows: usize) {
+		if self.closed {
+			return;
+		}
 		unsafe {
 			let api = conpty_api();
-			let _ = (api.resize)(
-				self.hpc,
-				COORD {
-					X: cols.max(1) as i16,
-					Y: rows.max(1) as i16,
-				},
+			(api.resize)(self.hpc, COORD {
+				X: cols.max(1) as i16,
+				Y: rows.max(1) as i16,
+			});
+		}
+	}
+
+	/// Ask the shell to end its foreground job. conhost on this build swallows
+	/// the Ctrl+C key event without ever raising CTRL_C_EVENT, so the signal
+	/// has to be raised on the shell's side instead.
+	pub fn interrupt(&self) {
+		if self.closed {
+			return;
+		}
+		let mut written = 0u32;
+		unsafe {
+			let _ = WriteFile(
+				self.ctrl_write,
+				b"\x03".as_ptr(),
+				1,
+				&mut written,
+				null_mut(),
 			);
 		}
 	}
@@ -211,12 +263,13 @@ impl ConPty {
 		self.output_read
 	}
 
-	pub fn process_handle(&self) -> HANDLE {
-		self.process
-	}
-
-	pub fn input_write(&self) -> HANDLE {
-		self.input_write
+	/// The console process has ended. conhost keeps the output pipe open after the
+	/// client exits, so end of file never arrives; the process handle is the truth.
+	pub fn exited(&self) -> bool {
+		if self.process.is_null() {
+			return true;
+		}
+		unsafe { WaitForSingleObject(self.process, 0) == 0 } // WAIT_OBJECT_0
 	}
 
 	pub fn close(&mut self) {
@@ -224,23 +277,43 @@ impl ConPty {
 			return;
 		}
 		self.closed = true;
-		unsafe {
-			let _ = TerminateProcess(self.process, 0);
-			(conpty_api().close)(self.hpc);
-			CloseHandle(self.process);
-			CloseHandle(self.input_write);
-			CloseHandle(self.output_read);
-			CloseHandle(self.input_read);
-			CloseHandle(self.output_write);
-		}
+		let hpc = self.hpc as usize;
+		let process = self.process as usize;
+		let input_write = self.input_write as usize;
+		let ctrl_write = self.ctrl_write as usize;
+		// ClosePseudoConsole waits for the console to shut down and has been
+		// seen to stall for seconds; never let that block the UI thread.
+		std::thread::spawn(move || unsafe {
+			let hpc = hpc as HPCON;
+			let process = process as HANDLE;
+			let input_write = input_write as HANDLE;
+			let pid = GetProcessId(process);
+			if pid != 0 {
+				let _ = std::process::Command::new("taskkill")
+					.args(["/PID", &pid.to_string(), "/T", "/F"])
+					.stdin(std::process::Stdio::null())
+					.stdout(std::process::Stdio::null())
+					.stderr(std::process::Stdio::null())
+					.status();
+			}
+			let _ = TerminateProcess(process, 0);
+			(conpty_api().close)(hpc);
+			CloseHandle(process);
+			CloseHandle(input_write);
+			CloseHandle(ctrl_write as HANDLE);
+		});
+	}
+}
+
+impl Drop for ConPty {
+	fn drop(&mut self) {
+		self.close();
 	}
 }
 
 fn environment_block(extra: &[(String, String)]) -> Vec<u16> {
 	let mut entries: Vec<(String, String)> = std::env::vars_os()
-		.filter_map(|(key, value)| {
-			Some((key.to_str()?.to_string(), value.to_str()?.to_string()))
-		})
+		.filter_map(|(key, value)| Some((key.to_str()?.to_string(), value.to_str()?.to_string())))
 		.filter(|(key, _)| !extra.iter().any(|(name, _)| name.eq_ignore_ascii_case(key)))
 		.collect();
 	entries.extend(extra.iter().cloned());
@@ -258,50 +331,7 @@ fn environment_block(extra: &[(String, String)]) -> Vec<u16> {
 	block
 }
 
-pub fn smoke() -> io::Result<()> {
-	use std::sync::{Arc, Mutex};
-	use std::thread;
-	use std::time::Duration;
-	let pty = ConPty::spawn(80, 24, "cmd.exe /C echo hello-from-conpty")?;
-	let out = pty.output_read() as usize;
-	let data = Arc::new(Mutex::new(Vec::<u8>::new()));
-	let d2 = data.clone();
-	thread::spawn(move || {
-		let out = out as HANDLE;
-		let mut buf = [0u8; 4096];
-		for _ in 0..16 {
-			let mut n = 0u32;
-			let ok =
-				unsafe { ReadFile(out, buf.as_mut_ptr(), buf.len() as u32, &mut n, null_mut()) };
-			if ok == 0 || n == 0 {
-				break;
-			}
-			d2.lock().unwrap().extend_from_slice(&buf[..n as usize]);
-		}
-	});
-	thread::sleep(Duration::from_millis(1200));
-	use std::io::Write;
-	let bytes = data.lock().unwrap().clone();
-	let mut out = std::io::stdout();
-	let _ = writeln!(
-		out,
-		"{} bytes: {}",
-		bytes.len(),
-		String::from_utf8_lossy(&bytes).trim_end()
-	);
-	let _ = out.flush();
-	std::process::exit(0);
-}
-
-impl Drop for ConPty {
-	fn drop(&mut self) {
-		self.close();
-	}
-}
-
-type CreatePseudoConsoleFn =
-	unsafe extern "system" fn(COORD, HANDLE, HANDLE, u32, *mut HPCON) -> i32;
-type ResizePseudoConsoleFn = unsafe extern "system" fn(HPCON, COORD) -> i32;
+type CreatePseudoConsoleFn = unsafe extern "system" fn(COORD, HANDLE, HANDLE, u32, *mut HPCON) -> i32;type ResizePseudoConsoleFn = unsafe extern "system" fn(HPCON, COORD) -> i32;
 type ClosePseudoConsoleFn = unsafe extern "system" fn(HPCON);
 
 struct ConPtyApi {
@@ -330,19 +360,11 @@ unsafe fn resolve(module: HMODULE, name: &str) -> FARPROC {
 
 fn load_conpty_api() -> ConPtyApi {
 	unsafe {
-		let kernel_name: Vec<u16> = "kernel32.dll"
-			.encode_utf16()
-			.chain(std::iter::once(0))
-			.collect();
+		let kernel_name: Vec<u16> = "kernel32.dll".encode_utf16().chain(std::iter::once(0)).collect();
 		let kernel = GetModuleHandleW(kernel_name.as_ptr());
 		let create = resolve(kernel, "CreatePseudoConsole").expect("CreatePseudoConsole");
 		let resize = resolve(kernel, "ResizePseudoConsole").expect("ResizePseudoConsole");
 		let close = resolve(kernel, "ClosePseudoConsole").expect("ClosePseudoConsole");
-		ConPtyApi {
-			create: transmute(create),
-			resize: transmute(resize),
-			close: transmute(close),
-		}
+		ConPtyApi { create: transmute(create), resize: transmute(resize), close: transmute(close) }
 	}
 }
-

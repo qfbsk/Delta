@@ -4,8 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+delta-vt = { path = "../delta-vt" }
+arboard = "3"
 base64 = "0.22"
 png = "0.17"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tree-sitter = "0.25"
 tree-sitter-c = "0.24"
@@ -23,6 +26,7 @@ windows-sys = { version = "0.61", features = [
 	"Win32_System_Console",
 	"Win32_System_DataExchange",
 	"Win32_System_IO",
+	"Win32_System_JobObjects",
 	"Win32_System_LibraryLoader",
 	"Win32_System_Memory",
 	"Win32_System_Pipes",
@@ -31,4 +35,5 @@ windows-sys = { version = "0.61", features = [
 	"Win32_UI_Input_Ime",
 	"Win32_UI_Input_KeyboardAndMouse",
 	"Win32_UI_WindowsAndMessaging",
+	"Win32_UI_HiDpi",
 ] }

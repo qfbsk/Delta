@@ -1,3 +1,8 @@
 [workspace]
-members = ["crates/delta-term", "crates/delta-odd"]
+members = ["crates/delta-vt", "crates/delta-term", "crates/delta-odd"]
 resolver = "2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+panic = "abort"

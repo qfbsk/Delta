@@ -1,579 +1,401 @@
-use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
 
-use unicode_width::UnicodeWidthChar;
+use delta_vt::{Color, Screen};
+use windows_sys::Win32::Foundation::HWND;
+use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
 
-const MAX_SCROLLBACK: usize = 2000;
+use crate::canvas::{self, Canvas};
+use crate::layout::Rect;
+use crate::pty::ConPty;
 
-#[derive(Clone, Copy, Debug)]
-pub struct ImagePlacement {
-	pub x: usize,
-	pub y: usize,
-	pub cols: Option<usize>,
-	pub rows: Option<usize>,
+pub const WM_APP_DATA: u32 = windows_sys::Win32::UI::WindowsAndMessaging::WM_APP + 10;
+pub const WM_APP_EXIT: u32 = windows_sys::Win32::UI::WindowsAndMessaging::WM_APP + 11;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Point {
+	pub row: usize,
+	pub col: usize,
 }
 
-#[derive(Clone, Debug)]
-pub struct Image {
-	pub id: u32,
-	pub width: usize,
-	pub height: usize,
-	pub rgba: Vec<u8>,
-	pub placement: Option<ImagePlacement>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Selection {
+	pub anchor: Point,
+	pub cursor: Point,
+	pub alt: bool,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Color {
-	Default,
-	Indexed(u8),
-	Rgb(u8, u8, u8),
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Attrs {
-	pub fg: Color,
-	pub bg: Color,
-	pub bold: bool,
-	pub underline: bool,
-	pub reverse: bool,
-}
-
-impl Default for Attrs {
-	fn default() -> Self {
-		Self {
-			fg: Color::Default,
-			bg: Color::Default,
-			bold: false,
-			underline: false,
-			reverse: false,
-		}
-	}
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct Cell {
-	pub ch: char,
-	pub width: u8,
-	pub attrs: Attrs,
-}
-
-impl Default for Cell {
-	fn default() -> Self {
-		Self {
-			ch: ' ',
-			width: 1,
-			attrs: Attrs::default(),
-		}
-	}
-}
-
-#[derive(Clone, Debug)]
-pub struct Screen {
-	pub cols: usize,
-	pub rows: usize,
-	pub cells: Vec<Cell>,
-	pub cursor_x: usize,
-	pub cursor_y: usize,
-	pub scroll_top: usize,
-	pub scroll_bottom: usize,
-	pub wrap_pending: bool,
-	pub history: VecDeque<Vec<Cell>>,
-	saved_x: usize,
-	saved_y: usize,
-}
-
-impl Screen {
-	pub fn new(cols: usize, rows: usize) -> Self {
-		let mut s = Self {
-			cols,
-			rows,
-			cells: Vec::new(),
-			cursor_x: 0,
-			cursor_y: 0,
-			scroll_top: 0,
-			scroll_bottom: rows.saturating_sub(1),
-			wrap_pending: false,
-			history: VecDeque::new(),
-			saved_x: 0,
-			saved_y: 0,
-		};
-		s.clear();
-		s
-	}
-
-	pub fn clear(&mut self) {
-		self.cells = vec![Cell::default(); self.cols * self.rows];
-		self.history.clear();
-		self.cursor_x = 0;
-		self.cursor_y = 0;
-		self.scroll_top = 0;
-		self.scroll_bottom = self.rows.saturating_sub(1);
-		self.wrap_pending = false;
-	}
-
-	pub fn resize(&mut self, cols: usize, rows: usize) {
-		let cols = cols.max(1);
-		let rows = rows.max(1);
-		if cols == self.cols && rows == self.rows {
-			return;
-		}
-		let mut cells = vec![Cell::default(); cols * rows];
-		for y in 0..rows.min(self.rows) {
-			for x in 0..cols.min(self.cols) {
-				cells[y * cols + x] = self.cells[y * self.cols + x];
-			}
-		}
-		self.cols = cols;
-		self.rows = rows;
-		self.cells = cells;
-		self.history.clear();
-		self.cursor_x = self.cursor_x.min(cols - 1);
-		self.cursor_y = self.cursor_y.min(rows - 1);
-		self.scroll_top = 0;
-		self.scroll_bottom = rows - 1;
-		self.wrap_pending = false;
-	}
-
-	pub fn index(&self, x: usize, y: usize) -> usize {
-		y * self.cols + x
-	}
-
-	pub fn cell(&self, x: usize, y: usize) -> Cell {
-		if x >= self.cols || y >= self.rows {
-			Cell::default()
+impl Selection {
+	fn range(&self) -> (Point, Point) {
+		if (self.anchor.row, self.anchor.col) <= (self.cursor.row, self.cursor.col) {
+			(self.anchor, self.cursor)
 		} else {
-			self.cells[self.index(x, y)]
+			(self.cursor, self.anchor)
 		}
 	}
 
-	fn set(&mut self, x: usize, y: usize, cell: Cell) {
-		if x < self.cols && y < self.rows {
-			let i = self.index(x, y);
-			self.cells[i] = cell;
-		}
-	}
-
-	pub fn blank_row(&mut self, y: usize) {
-		for x in 0..self.cols {
-			let i = self.index(x, y);
-			self.cells[i] = Cell::default();
-		}
-	}
-
-	pub fn put(&mut self, ch: char, attrs: Attrs) {
-		if ch == '\0' {
-			return;
-		}
-		let width = UnicodeWidthChar::width(ch).unwrap_or(1).clamp(1, 2);
-		if self.wrap_pending {
-			self.newline();
-		}
-		if width == 2 && self.cursor_x + 1 >= self.cols {
-			self.newline();
-		}
-		let x = self.cursor_x;
-		let y = self.cursor_y;
-		self.set(
-			x,
-			y,
-			Cell {
-				ch,
-				width: width as u8,
-				attrs,
-			},
-		);
-		if width == 2 {
-			self.set(
-				x + 1,
-				y,
-				Cell {
-					ch: ' ',
-					width: 0,
-					attrs,
-				},
-			);
-		}
-		if x + width >= self.cols {
-			self.cursor_x = self.cols - 1;
-			self.wrap_pending = true;
-		} else {
-			self.cursor_x = x + width;
-			self.wrap_pending = false;
-		}
-	}
-
-	pub fn newline(&mut self) {
-		self.wrap_pending = false;
-		if self.cursor_y == self.scroll_bottom {
-			self.scroll_up(1);
-		} else if self.cursor_y + 1 < self.rows {
-			self.cursor_y += 1;
-		}
-		self.cursor_x = 0;
-	}
-
-	pub fn carriage_return(&mut self) {
-		self.cursor_x = 0;
-		self.wrap_pending = false;
-	}
-
-	pub fn backspace(&mut self) {
-		self.cursor_x = self.cursor_x.saturating_sub(1);
-		self.wrap_pending = false;
-	}
-
-	pub fn tab(&mut self) {
-		let next = (self.cursor_x / 8 + 1) * 8;
-		self.cursor_x = next.min(self.cols - 1);
-		self.wrap_pending = false;
-	}
-
-	pub fn scroll_up(&mut self, n: usize) {
-		let top = self.scroll_top;
-		let bottom = self.scroll_bottom;
-		if top > bottom || bottom >= self.rows {
-			return;
-		}
-		for _ in 0..n {
-			if top == 0 && bottom + 1 == self.rows {
-				self.history.push_back(self.cells[0..self.cols].to_vec());
-				while self.history.len() > MAX_SCROLLBACK {
-					self.history.pop_front();
-				}
-			}
-			for y in top..bottom {
-				let src = (y + 1) * self.cols;
-				let dst = y * self.cols;
-				for x in 0..self.cols {
-					self.cells[dst + x] = self.cells[src + x];
-				}
-			}
-			self.blank_row(bottom);
-		}
-	}
-
-	pub fn scroll_down(&mut self, n: usize) {
-		let top = self.scroll_top;
-		let bottom = self.scroll_bottom;
-		if top > bottom || bottom >= self.rows {
-			return;
-		}
-		for _ in 0..n {
-			for y in (top + 1..=bottom).rev() {
-				let src = (y - 1) * self.cols;
-				let dst = y * self.cols;
-				for x in 0..self.cols {
-					self.cells[dst + x] = self.cells[src + x];
-				}
-			}
-			self.blank_row(top);
-		}
-	}
-
-	pub fn erase_display(&mut self, mode: usize) {
-		match mode {
-			0 => {
-				for x in self.cursor_x..self.cols {
-					self.set(x, self.cursor_y, Cell::default());
-				}
-				for y in self.cursor_y + 1..self.rows {
-					self.blank_row(y);
-				}
-			}
-			1 => {
-				for y in 0..self.cursor_y {
-					self.blank_row(y);
-				}
-				for x in 0..=self.cursor_x.min(self.cols - 1) {
-					self.set(x, self.cursor_y, Cell::default());
-				}
-			}
-			_ => {
-				for y in 0..self.rows {
-					self.blank_row(y);
-				}
-				if mode == 3 {
-					self.history.clear();
-				}
-			}
-		}
-		self.wrap_pending = false;
-	}
-
-	pub fn erase_line(&mut self, mode: usize) {
-		match mode {
-			0 => {
-				for x in self.cursor_x..self.cols {
-					self.set(x, self.cursor_y, Cell::default());
-				}
-			}
-			1 => {
-				for x in 0..=self.cursor_x.min(self.cols - 1) {
-					self.set(x, self.cursor_y, Cell::default());
-				}
-			}
-			_ => self.blank_row(self.cursor_y),
-		}
-		self.wrap_pending = false;
-	}
-
-	pub fn move_to(&mut self, x: usize, y: usize) {
-		self.cursor_x = x.min(self.cols - 1);
-		self.cursor_y = y.min(self.rows - 1);
-		self.wrap_pending = false;
-	}
-
-	pub fn view_cell(&self, x: usize, y: usize, offset: usize) -> Cell {
-		if offset == 0 {
-			return self.cell(x, y);
-		}
-		let history_len = self.history.len();
-		let offset = offset.min(history_len);
-		let index = history_len.saturating_sub(offset) + y;
-		if index < history_len {
-			self.history
-				.get(index)
-				.and_then(|row| row.get(x))
-				.copied()
-				.unwrap_or_default()
-		} else {
-			self.cell(x, index - history_len)
-		}
-	}
-
-	pub fn save_cursor(&mut self) {
-		self.saved_x = self.cursor_x;
-		self.saved_y = self.cursor_y;
-	}
-
-	pub fn restore_cursor(&mut self) {
-		self.cursor_x = self.saved_x.min(self.cols - 1);
-		self.cursor_y = self.saved_y.min(self.rows - 1);
-		self.wrap_pending = false;
-	}
-
-	pub fn insert_chars(&mut self, n: usize) {
-		let y = self.cursor_y;
-		let x = self.cursor_x;
-		let n = n.min(self.cols - x);
-		for i in (x..self.cols).rev() {
-			let src = if i >= x + n { i - n } else { self.cols - 1 };
-			let cell = if i >= x + n {
-				self.cell(src, y)
-			} else {
-				Cell::default()
-			};
-			self.set(i, y, cell);
-		}
-		self.wrap_pending = false;
-	}
-
-	pub fn delete_chars(&mut self, n: usize) {
-		let y = self.cursor_y;
-		let x = self.cursor_x;
-		let n = n.min(self.cols - x);
-		for i in x..self.cols {
-			let cell = if i + n < self.cols {
-				self.cell(i + n, y)
-			} else {
-				Cell::default()
-			};
-			self.set(i, y, cell);
-		}
-		self.wrap_pending = false;
-	}
-
-	pub fn erase_chars(&mut self, n: usize) {
-		let y = self.cursor_y;
-		for x in self.cursor_x..(self.cursor_x + n).min(self.cols) {
-			self.set(x, y, Cell::default());
-		}
-		self.wrap_pending = false;
-	}
-
-	pub fn insert_lines(&mut self, n: usize) {
-		let n = n.min(self.scroll_bottom.saturating_sub(self.cursor_y));
-		for _ in 0..n {
-			for y in (self.cursor_y + 1..=self.scroll_bottom).rev() {
-				let src = (y - 1) * self.cols;
-				let dst = y * self.cols;
-				for x in 0..self.cols {
-					self.cells[dst + x] = self.cells[src + x];
-				}
-			}
-			self.blank_row(self.cursor_y);
-		}
-		self.wrap_pending = false;
-	}
-
-	pub fn delete_lines(&mut self, n: usize) {
-		let n = n.min(self.scroll_bottom.saturating_sub(self.cursor_y));
-		for _ in 0..n {
-			for y in self.cursor_y..self.scroll_bottom {
-				let src = (y + 1) * self.cols;
-				let dst = y * self.cols;
-				for x in 0..self.cols {
-					self.cells[dst + x] = self.cells[src + x];
-				}
-			}
-			self.blank_row(self.scroll_bottom);
-		}
-		self.wrap_pending = false;
+	fn contains(&self, row: usize, col: usize) -> bool {
+		let (a, b) = self.range();
+		(row, col) >= (a.row, a.col) && (row, col) <= (b.row, b.col)
 	}
 }
 
-pub struct Terminal {
-	pub main: Screen,
-	pub alt: Option<Screen>,
-	pub alt_active: bool,
-	pub attrs: Attrs,
-	pub cursor_visible: bool,
-	pub app_cursor: bool,
-	pub wrap_mode: bool,
-	pub scroll_offset: usize,
-	pub images: Vec<Image>,
-	next_image_id: u32,
+pub struct TerminalPane {
+	pub pty: Option<ConPty>,
+	pub screen: Screen,
+	queue: Arc<Mutex<Vec<u8>>>,
+	/// set while a WM_APP_DATA notification is pending; cleared when the queue is drained
+	data_posted: Arc<AtomicBool>,
+	pub title: String,
+	/// lines scrolled up from the bottom; 0 means live.
+	pub scroll: usize,
+	pub selection: Option<Selection>,
+	pub exited: bool,
+	pub bell: bool,
+	pub alt: bool,
 }
 
-impl Terminal {
-	pub fn new(cols: usize, rows: usize) -> Self {
-		Self {
-			main: Screen::new(cols, rows),
-			alt: None,
-			alt_active: false,
-			attrs: Attrs::default(),
-			cursor_visible: true,
-			app_cursor: false,
-			wrap_mode: true,
-			scroll_offset: 0,
-			images: Vec::new(),
-			next_image_id: 1,
-		}
+impl TerminalPane {
+	pub fn new(
+		cols: usize,
+		rows: usize,
+		command: &str,
+		envs: &[(String, String)],
+	) -> std::io::Result<Self> {
+		let pty = ConPty::spawn_with_env(cols, rows, command, envs)?;
+		Ok(Self {
+			pty: Some(pty),
+			screen: Screen::new(cols, rows),
+			queue: Arc::new(Mutex::new(Vec::new())),
+			data_posted: Arc::new(AtomicBool::new(false)),
+			title: String::new(),
+			scroll: 0,
+			selection: None,
+			exited: false,
+			bell: false,
+			alt: false,
+		})
 	}
 
-	pub fn rows(&self) -> usize {
-		self.active().rows
-	}
-
-	pub fn active(&self) -> &Screen {
-		if self.alt_active {
-			self.alt.as_ref().unwrap_or(&self.main)
-		} else {
-			&self.main
-		}
-	}
-
-	pub fn active_mut(&mut self) -> &mut Screen {
-		if self.alt_active {
-			self.alt.as_mut().unwrap_or(&mut self.main)
-		} else {
-			&mut self.main
-		}
-	}
-
-	pub fn resize(&mut self, cols: usize, rows: usize) {
-		self.main.resize(cols, rows);
-		self.scroll_offset = 0;
-		if let Some(alt) = self.alt.as_mut() {
-			alt.resize(cols, rows);
-		}
-	}
-
-	pub fn reset(&mut self) {
-		self.main.clear();
-		self.alt = None;
-		self.alt_active = false;
-		self.attrs = Attrs::default();
-		self.cursor_visible = true;
-		self.app_cursor = false;
-		self.wrap_mode = true;
-		self.scroll_offset = 0;
-		self.images.clear();
-		self.next_image_id = 1;
-	}
-
-	pub fn enter_alt(&mut self) {
-		if self.alt_active {
-			return;
-		}
-		let mut alt = Screen::new(self.main.cols, self.main.rows);
-		alt.clear();
-		self.alt = Some(alt);
-		self.alt_active = true;
-	}
-
-	pub fn leave_alt(&mut self) {
-		self.alt_active = false;
-		self.alt = None;
-	}
-
-	pub fn set_image(
-		&mut self,
-		id: Option<u32>,
-		width: usize,
-		height: usize,
-		rgba: Vec<u8>,
-		placement: Option<ImagePlacement>,
-	) -> u32 {
-		let id = id.unwrap_or(self.next_image_id).max(1);
-		self.next_image_id = self.next_image_id.max(id + 1);
-		self.images.retain(|image| image.id != id);
-		self.images.push(Image {
-			id,
-			width,
-			height,
-			rgba,
-			placement,
+	pub fn start_reader(&mut self, hwnd: HWND, pane: u32) {
+		let Some(pty) = &self.pty else { return };
+		let handle = pty.output_read() as isize;
+		let hwnd = hwnd as isize;
+		let queue = self.queue.clone();
+		let data_posted = self.data_posted.clone();
+		thread::spawn(move || {
+			let hwnd = hwnd as windows_sys::Win32::Foundation::HWND;
+			let handle = handle as windows_sys::Win32::Foundation::HANDLE;
+			let mut buf = [0u8; 8192];
+			loop {
+				let mut n = 0u32;
+				let ok = unsafe {
+					windows_sys::Win32::Storage::FileSystem::ReadFile(
+						handle,
+						buf.as_mut_ptr(),
+						buf.len() as u32,
+						&mut n,
+						std::ptr::null_mut(),
+					)
+				};
+				if ok == 0 || n == 0 {
+					unsafe {
+						windows_sys::Win32::Foundation::CloseHandle(handle);
+						PostMessageW(hwnd, WM_APP_EXIT, pane as usize, 0);
+					}
+					break;
+				}
+				if let Ok(mut q) = queue.lock() {
+					if q.len() < (1 << 24) {
+						q.extend_from_slice(&buf[..n as usize]);
+					}
+				}
+				// One notification is enough no matter how many chunks arrive; the UI drains the
+				// whole queue per notification. A rapid stream would otherwise bury input keys
+				// under thousands of duplicate posted messages.
+				if !data_posted.swap(true, Ordering::SeqCst) {
+					unsafe {
+						PostMessageW(hwnd, WM_APP_DATA, pane as usize, 0);
+					}
+				}
+			}
 		});
-		id
 	}
 
-	pub fn place_image(
-		&mut self,
-		id: u32,
-		x: usize,
-		y: usize,
-		cols: Option<usize>,
-		rows: Option<usize>,
+	pub fn process_exited(&self) -> bool {
+		match &self.pty {
+			Some(pty) => pty.exited(),
+			None => true,
+		}
+	}
+
+	pub fn drain(&mut self) -> bool {
+		self.data_posted.store(false, Ordering::SeqCst);
+		let bytes = {
+			let Ok(mut q) = self.queue.lock() else { return false };
+			if q.is_empty() {
+				return false;
+			}
+			std::mem::take(&mut *q)
+		};
+		self.screen.feed(&bytes);
+		if self.screen.bell {
+			self.screen.bell = false;
+			self.bell = true;
+		}
+		self.alt = self.screen.is_alt();
+		let response = self.screen.take_response();
+		if !response.is_empty() {
+			self.write(&response);
+		}
+		if let Some(cwd) = self.screen.cwd.clone() {
+			let _ = cwd;
+		}
+		if self.screen.title != self.title {
+			self.title = self.screen.title.clone();
+		}
+		self.scroll = self.scroll.min(self.max_scroll());
+		true
+	}
+
+	pub fn write(&self, bytes: &[u8]) {
+		if let Some(pty) = &self.pty {
+			pty.write(bytes);
+		}
+	}
+
+	pub fn max_scroll(&self) -> usize {
+		if self.alt {
+			0
+		} else {
+			self.screen.scrollback_len()
+		}
+	}
+
+	pub fn scroll_up(&mut self, lines: usize) {
+		self.scroll = (self.scroll + lines).min(self.max_scroll());
+	}
+
+	pub fn scroll_down(&mut self, lines: usize) {
+		self.scroll = self.scroll.saturating_sub(lines);
+	}
+
+	pub fn resize(&mut self, cols: usize, rows: usize) {
+		if cols == self.screen.cols && rows == self.screen.rows {
+			return;
+		}
+		self.screen.resize(cols.max(1), rows.max(1));
+		if let Some(pty) = &self.pty {
+			pty.resize(cols.max(1), rows.max(1));
+		}
+		self.scroll = self.scroll.min(self.max_scroll());
+	}
+
+	pub fn paste(&self, text: &str) {
+		let mut out = String::new();
+		if self.screen.modes.bracketed_paste {
+			out.push_str("\x1b[200~");
+		}
+		let mut first = true;
+		for part in text.split('\n') {
+			if !first {
+				out.push('\r');
+			}
+			first = false;
+			out.push_str(part.strip_suffix('\r').unwrap_or(part));
+		}
+		if self.screen.modes.bracketed_paste {
+			out.push_str("\x1b[201~");
+		}
+		self.write(out.as_bytes());
+	}
+
+	pub fn snapshot(&self) -> String {
+		if self.alt {
+			self.screen.alt_text()
+		} else {
+			self.screen.all_text()
+		}
+	}
+
+	pub fn selection_text(&self) -> Option<String> {
+		let sel = self.selection?;
+		if sel.alt != self.alt {
+			return None;
+		}
+		let (a, b) = sel.range();
+		if sel.alt {
+			let mut out = String::new();
+			for r in a.row..=b.row {
+				let Some(row) = self.screen.alt_row(r) else { continue };
+				let from = if r == a.row { a.col.min(row.cells.len()) } else { 0 };
+				let to = if r == b.row { (b.col + 1).min(row.cells.len()) } else { row.cells.len() };
+				for c in &row.cells[from..to] {
+					if c.wide == 2 {
+						continue;
+					}
+					out.push(c.ch);
+					if c.has_comb {
+						out.push(c.comb);
+					}
+				}
+				if r != b.row {
+					out.push('\n');
+				}
+			}
+			Some(out)
+		} else {
+			Some(self.screen.text_between(a.row, a.col, b.row, b.col))
+		}
+	}
+
+	pub fn cell_at_view(&self, row: usize, col: usize) -> usize {
+		let top = self.view_top();
+		top + row
+	}
+
+	pub fn view_top(&self) -> usize {
+		if self.alt {
+			0
+		} else {
+			let total = self.screen.scrollback_len() + self.screen.rows;
+			total.saturating_sub(self.screen.rows + self.scroll)
+		}
+	}
+
+	pub fn row_at(&self, idx: usize) -> Option<&delta_vt::Row> {
+		if self.alt {
+			self.screen.alt_row(idx)
+		} else {
+			self.screen.row_abs(idx)
+		}
+	}
+
+	pub fn render(
+		&self,
+		canvas: &Canvas,
+		area: Rect,
+		focused: bool,
+		show_cursor: bool,
+		pane_number: Option<u32>,
 	) {
-		if let Some(image) = self.images.iter_mut().find(|image| image.id == id) {
-			image.placement = Some(ImagePlacement { x, y, cols, rows });
-		}
-	}
+		let cw = canvas.cell_w;
+		let ch = canvas.cell_h;
+		let cols = (area.width() / cw).max(1) as usize;
+		let rows = (area.height() / ch).max(1) as usize;
+		let (width, height) = (cols as i32 * cw, rows as i32 * ch);
+		let default_bg = canvas::rgb(canvas::DEFAULT_BG.0, canvas::DEFAULT_BG.1, canvas::DEFAULT_BG.2);
+		canvas.fill(area.left, area.top, area.left + width, area.top + height, default_bg);
+		let saved = canvas.clip((area.left, area.top, area.left + width, area.top + height));
+		let (cc, cr) = self.screen.cursor();
+		let cursor_abs = if self.alt { cr } else { self.screen.scrollback_len() + cr };
+		let sel = self
+			.selection
+			.filter(|s| s.alt == self.alt && (s.anchor.row, s.anchor.col) != (s.cursor.row, s.cursor.col));
 
-	pub fn delete_images(&mut self, id: Option<u32>) {
-		match id {
-			Some(id) => self.images.retain(|image| image.id != id),
-			None => self.images.clear(),
+		for row in 0..rows {
+			let abs = self.view_top() + row;
+			let Some(line) = self.row_at(abs) else { continue };
+			let y = area.top + row as i32 * ch;
+			for col in 0..cols {
+				let Some(cell) = line.cells.get(col) else { continue };
+				let mut fg = cell.fg;
+				let mut bg = cell.bg;
+				let bold = cell.attrs & delta_vt::ATTR_BOLD != 0;
+				let dim = cell.attrs & delta_vt::ATTR_DIM != 0;
+				let reverse = cell.attrs & delta_vt::ATTR_REVERSE != 0
+					|| self.screen.modes.reverse_video;
+				if reverse {
+					std::mem::swap(&mut fg, &mut bg);
+					if fg == Color::Default {
+						fg = self.screen.default_bg;
+					}
+					if bg == Color::Default {
+						bg = self.screen.default_fg;
+					}
+				}
+				let mut bg_color = canvas::colorref(bg, false, true);
+				let mut fg_color = canvas::colorref(fg, bold, false);
+				if dim {
+					fg_color = canvas::rgb(
+						(((fg_color & 0xff) as u8) as u16 * 2 / 3) as u8,
+						((((fg_color >> 8) & 0xff) as u8) as u16 * 2 / 3) as u8,
+						((((fg_color >> 16) & 0xff) as u8) as u16 * 2 / 3) as u8,
+					);
+				}
+				if cell.bg != Color::Default || reverse {
+					canvas.fill(
+						area.left + col as i32 * cw,
+						y,
+						area.left + (col as i32 + 1) * cw,
+						y + ch,
+						bg_color,
+					);
+				}
+				if cell.wide == 2 {
+					continue;
+				}
+				if let Some(sel) = sel {
+					if sel.contains(abs, col) {
+						bg_color = canvas::rgb(
+							canvas::SELECTION_BG.0,
+							canvas::SELECTION_BG.1,
+							canvas::SELECTION_BG.2,
+						);
+						canvas.fill(
+							area.left + col as i32 * cw,
+							y,
+							area.left + (col as i32 + 1) * cw * if cell.wide == 1 { 2 } else { 1 },
+							y + ch,
+							bg_color,
+						);
+					}
+				}
+				if show_cursor && focused && !self.exited && abs == cursor_abs && col == cc {
+					canvas.fill(
+						area.left + col as i32 * cw,
+						y,
+						area.left + (col as i32 + 1) * cw,
+						y + ch,
+						canvas::rgb(canvas::ACCENT.0, canvas::ACCENT.1, canvas::ACCENT.2),
+					);
+					fg_color = canvas::rgb(10, 12, 16);
+				}
+				if cell.ch != ' ' || cell.has_comb {
+					let mut text = String::new();
+					text.push(cell.ch);
+					if cell.has_comb {
+						text.push(cell.comb);
+					}
+					canvas.text(area.left + col as i32 * cw, y, &text, fg_color);
+				}
+				if cell.attrs & (delta_vt::ATTR_UNDERLINE | delta_vt::ATTR_DOUBLE_UNDERLINE) != 0 {
+					canvas.line(
+						area.left + col as i32 * cw,
+						y + ch - 2,
+						area.left + (col as i32 + 1) * cw,
+						y + ch - 2,
+						fg_color,
+					);
+				}
+				if cell.attrs & delta_vt::ATTR_STRIKE != 0 {
+					canvas.line(
+						area.left + col as i32 * cw,
+						y + ch / 2,
+						area.left + (col as i32 + 1) * cw,
+						y + ch / 2,
+						fg_color,
+					);
+				}
+			}
 		}
-	}
-
-	pub fn scroll_view(&mut self, delta: isize) {
-		if self.alt_active {
-			return;
+		if let Some(n) = pane_number {
+			let label = format!(" {n} ");
+			let w = label.len() as i32 * cw;
+			canvas.fill(area.left, area.top, area.left + w, area.top + ch, canvas::rgb(60, 70, 90));
+			canvas.text(area.left, area.top, &label, canvas::rgb(240, 240, 240));
 		}
-		let max = self.main.history.len() as isize;
-		self.scroll_offset = ((self.scroll_offset as isize + delta).clamp(0, max)) as usize;
-	}
-
-	pub fn put_char(&mut self, ch: char) {
-		self.scroll_offset = 0;
-		if !self.wrap_mode && self.active().cursor_x + 1 >= self.active().cols {
-			// Without autowrap, a full line just overwrites the last cell.
-			let attrs = self.attrs;
-			let x = self.active().cols.saturating_sub(1);
-			let y = self.active().cursor_y;
-			self.active_mut().set(
-				x,
-				y,
-				Cell {
-					ch,
-					width: 1,
-					attrs,
-				},
-			);
-			return;
-		}
-		let attrs = self.attrs;
-		self.active_mut().put(ch, attrs);
+		canvas.unclip(saved);
 	}
 }
