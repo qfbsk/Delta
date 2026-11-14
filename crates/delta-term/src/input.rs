@@ -79,7 +79,11 @@ impl Key {
 }
 
 pub fn encode_win32(key: &Key) -> String {
-	let uc = if key.down { key.ch.map(|c| c as u32).unwrap_or(0) } else { 0 };
+	let uc = if key.down {
+		key.ch.map(|c| c as u32).unwrap_or(0)
+	} else {
+		0
+	};
 	format!(
 		"\x1b[{};{};{};{};{};{}_",
 		key.vk,
@@ -300,7 +304,10 @@ pub fn encode_kitty(key: &Key, flags: u8) -> Vec<u8> {
 		String::new()
 	};
 	let text = if flags & KITTY_TEXT != 0 {
-		key.ch.filter(|c| key.down).map(|c| format!(";{}", c as u32)).unwrap_or_default()
+		key.ch
+			.filter(|c| key.down)
+			.map(|c| format!(";{}", c as u32))
+			.unwrap_or_default()
 	} else {
 		String::new()
 	};
@@ -372,7 +379,10 @@ pub fn encode_kitty(key: &Key, flags: u8) -> Vec<u8> {
 	let Some(ch) = key.ch else {
 		return out;
 	};
-	let plain_text = key.down && !key.ctrl && !key.alt && flags & KITTY_ALL_KEYS == 0
+	let plain_text = key.down
+		&& !key.ctrl
+		&& !key.alt
+		&& flags & KITTY_ALL_KEYS == 0
 		&& !(flags & KITTY_DISAMBIGUATE != 0 && ch == '\x1b');
 	if plain_text {
 		let mut buf = [0u8; 4];
@@ -410,7 +420,13 @@ mod tests {
 	use super::*;
 
 	fn k(vk: u16, ch: Option<char>) -> Key {
-		Key { vk, ch, down: true, repeat: 1, ..Key::default() }
+		Key {
+			vk,
+			ch,
+			down: true,
+			repeat: 1,
+			..Key::default()
+		}
 	}
 
 	#[test]
@@ -476,6 +492,9 @@ mod tests {
 	fn kitty_event_types() {
 		let mut key = k(0x41, Some('a'));
 		key.down = false;
-		assert_eq!(encode_kitty(&key, KITTY_DISAMBIGUATE | KITTY_EVENT_TYPES), b"\x1b[97;1:3u");
+		assert_eq!(
+			encode_kitty(&key, KITTY_DISAMBIGUATE | KITTY_EVENT_TYPES),
+			b"\x1b[97;1:3u"
+		);
 	}
 }

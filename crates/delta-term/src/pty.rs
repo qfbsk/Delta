@@ -14,7 +14,7 @@ use windows_sys::Win32::Foundation::{
 	SetHandleInformation,
 };
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
-use windows_sys::Win32::Storage::FileSystem::{WriteFile, PIPE_ACCESS_OUTBOUND};
+use windows_sys::Win32::Storage::FileSystem::{PIPE_ACCESS_OUTBOUND, WriteFile};
 use windows_sys::Win32::System::Console::{COORD, HPCON};
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows_sys::Win32::System::Pipes::{
@@ -107,7 +107,10 @@ impl ConPty {
 			let api = conpty_api();
 			let create_flags = PSEUDOCONSOLE_RESIZE_QUIRK;
 			let hr = (api.create)(
-				COORD { X: cols.max(1) as i16, Y: rows.max(1) as i16 },
+				COORD {
+					X: cols.max(1) as i16,
+					Y: rows.max(1) as i16,
+				},
 				input_read,
 				output_write,
 				create_flags,
@@ -233,10 +236,13 @@ impl ConPty {
 		}
 		unsafe {
 			let api = conpty_api();
-			(api.resize)(self.hpc, COORD {
-				X: cols.max(1) as i16,
-				Y: rows.max(1) as i16,
-			});
+			(api.resize)(
+				self.hpc,
+				COORD {
+					X: cols.max(1) as i16,
+					Y: rows.max(1) as i16,
+				},
+			);
 		}
 	}
 
@@ -333,7 +339,9 @@ fn environment_block(extra: &[(String, String)]) -> Vec<u16> {
 	block
 }
 
-type CreatePseudoConsoleFn = unsafe extern "system" fn(COORD, HANDLE, HANDLE, u32, *mut HPCON) -> i32;type ResizePseudoConsoleFn = unsafe extern "system" fn(HPCON, COORD) -> i32;
+type CreatePseudoConsoleFn =
+	unsafe extern "system" fn(COORD, HANDLE, HANDLE, u32, *mut HPCON) -> i32;
+type ResizePseudoConsoleFn = unsafe extern "system" fn(HPCON, COORD) -> i32;
 type ClosePseudoConsoleFn = unsafe extern "system" fn(HPCON);
 
 struct ConPtyApi {
@@ -362,11 +370,18 @@ unsafe fn resolve(module: HMODULE, name: &str) -> FARPROC {
 
 fn load_conpty_api() -> ConPtyApi {
 	unsafe {
-		let kernel_name: Vec<u16> = "kernel32.dll".encode_utf16().chain(std::iter::once(0)).collect();
+		let kernel_name: Vec<u16> = "kernel32.dll"
+			.encode_utf16()
+			.chain(std::iter::once(0))
+			.collect();
 		let kernel = GetModuleHandleW(kernel_name.as_ptr());
 		let create = resolve(kernel, "CreatePseudoConsole").expect("CreatePseudoConsole");
 		let resize = resolve(kernel, "ResizePseudoConsole").expect("ResizePseudoConsole");
 		let close = resolve(kernel, "ClosePseudoConsole").expect("ClosePseudoConsole");
-		ConPtyApi { create: transmute(create), resize: transmute(resize), close: transmute(close) }
+		ConPtyApi {
+			create: transmute(create),
+			resize: transmute(resize),
+			close: transmute(close),
+		}
 	}
 }

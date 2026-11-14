@@ -54,7 +54,12 @@ pub struct Rect {
 
 impl Rect {
 	pub fn new(left: i32, top: i32, right: i32, bottom: i32) -> Self {
-		Self { left, top, right, bottom }
+		Self {
+			left,
+			top,
+			right,
+			bottom,
+		}
 	}
 
 	pub fn width(&self) -> i32 {
@@ -82,7 +87,12 @@ pub struct Geometry {
 impl Geometry {
 	/// layout_geometry_init.
 	fn sentinel() -> Self {
-		Self { sx: u32::MAX, sy: u32::MAX, xoff: i32::MAX, yoff: i32::MAX }
+		Self {
+			sx: u32::MAX,
+			sy: u32::MAX,
+			xoff: i32::MAX,
+			yoff: i32::MAX,
+		}
 	}
 }
 
@@ -103,7 +113,10 @@ pub struct Layout {
 impl Layout {
 	/// layout_init: one window pane filling the window.
 	pub fn new(pane: PaneId, sx: u32, sy: u32) -> Self {
-		let mut layout = Layout { cells: Vec::new(), root: None };
+		let mut layout = Layout {
+			cells: Vec::new(),
+			root: None,
+		};
 		let root = layout.create(None);
 		layout.set_size(root, sx.max(PANE_MINIMUM), sy.max(PANE_MINIMUM), 0, 0);
 		layout.make_leaf(root, pane);
@@ -140,14 +153,20 @@ impl Layout {
 		if n <= 1 {
 			return match panes.first() {
 				Some(pane) => Layout::new(*pane, sx, sy),
-				None => Layout { cells: Vec::new(), root: None },
+				None => Layout {
+					cells: Vec::new(),
+					root: None,
+				},
 			};
 		}
 		let (rows, columns) = Self::tiled_grid(n);
 		let width = ((sx - (columns - 1)) / columns).max(PANE_MINIMUM);
 		let height = ((sy - (rows - 1)) / rows).max(PANE_MINIMUM);
 
-		let mut layout = Layout { cells: Vec::new(), root: None };
+		let mut layout = Layout {
+			cells: Vec::new(),
+			root: None,
+		};
 		let root = layout.create(None);
 		layout.set_size(root, sx, sy, 0, 0);
 		layout.make_node(root, LayoutType::TopBottom);
@@ -182,7 +201,11 @@ impl Layout {
 				}
 				column += 1;
 			}
-			let last = if column == columns { column - 1 } else { column };
+			let last = if column == columns {
+				column - 1
+			} else {
+				column
+			};
 			let used = (last + 1) * (width + 1) - 1;
 			if sx > used {
 				if let Some(&cell) = layout.cells[row].cells.last() {
@@ -319,7 +342,9 @@ impl Layout {
 
 	/// layout_fix_panes: the geometry each pane should be resized to.
 	pub fn panes(&self) -> Vec<(PaneId, Geometry)> {
-		let Some(root) = self.root else { return Vec::new() };
+		let Some(root) = self.root else {
+			return Vec::new();
+		};
 		let mut out = Vec::new();
 		self.collect_panes(root, &mut out);
 		out
@@ -354,7 +379,11 @@ impl Layout {
 		if self.cells[idx].lc_type == LayoutType::WindowPane {
 			return 1;
 		}
-		self.cells[idx].cells.iter().map(|child| self.count_cells1(*child)).sum()
+		self.cells[idx]
+			.cells
+			.iter()
+			.map(|child| self.count_cells1(*child))
+			.sum()
 	}
 
 	/// layout_resize_check.
@@ -480,7 +509,8 @@ impl Layout {
 	fn get_neighbour(&self, idx: usize) -> Option<usize> {
 		let parent = self.cells[idx].parent?;
 		let forward = self.cells[parent].cells.last() != Some(&idx);
-		self.neighbour_dir(idx, forward).or_else(|| self.neighbour_dir(idx, !forward))
+		self.neighbour_dir(idx, forward)
+			.or_else(|| self.neighbour_dir(idx, !forward))
 	}
 
 	/// layout_destroy_cell, returning the cell that replaced a collapsed parent.
@@ -537,7 +567,9 @@ impl Layout {
 
 	/// layout_destroy_cell for the cell holding a pane.
 	pub fn destroy(&mut self, pane: PaneId) {
-		let Some(idx) = self.index_of(pane) else { return };
+		let Some(idx) = self.index_of(pane) else {
+			return;
+		};
 		self.destroy_cell(idx);
 		self.fix_offsets();
 	}
@@ -606,7 +638,9 @@ impl Layout {
 
 	/// layout_resize_pane: grow or shrink one pane by `change` cells.
 	pub fn resize_pane(&mut self, pane: PaneId, lc_type: LayoutType, change: i32, opposite: bool) {
-		let Some(mut lc) = self.index_of(pane) else { return };
+		let Some(mut lc) = self.index_of(pane) else {
+			return;
+		};
 		let mut parent = self.cells[lc].parent;
 		while let Some(p) = parent {
 			if self.cells[p].lc_type == lc_type {
@@ -619,7 +653,9 @@ impl Layout {
 
 		/* If this is the last tiled cell, move back one. */
 		if self.is_last_tiled(lc) {
-			let Some(previous) = self.neighbour_dir(lc, false) else { return };
+			let Some(previous) = self.neighbour_dir(lc, false) else {
+				return;
+			};
 			lc = previous;
 		}
 
@@ -673,11 +709,15 @@ impl Layout {
 			if size != 0 {
 				break;
 			}
-			let Some(previous) = self.neighbour_dir(remove, false) else { return 0 };
+			let Some(previous) = self.neighbour_dir(remove, false) else {
+				return 0;
+			};
 			remove = previous;
 		}
 
-		let Some(add) = self.neighbour_dir(idx, true) else { return 0 };
+		let Some(add) = self.neighbour_dir(idx, true) else {
+			return 0;
+		};
 
 		let mut size = size as i32;
 		if size > -needed {
@@ -751,7 +791,9 @@ impl Layout {
 			Dir::Right => LayoutType::LeftRight,
 			Dir::Down => LayoutType::TopBottom,
 		};
-		let Some(idx) = self.index_of(pane) else { return false };
+		let Some(idx) = self.index_of(pane) else {
+			return false;
+		};
 		self.cells[idx].lc_type == LayoutType::WindowPane && self.split_check_space(idx, lc_type)
 	}
 
@@ -761,7 +803,9 @@ impl Layout {
 			Dir::Right => LayoutType::LeftRight,
 			Dir::Down => LayoutType::TopBottom,
 		};
-		let Some(lc) = self.index_of(pane) else { return false };
+		let Some(lc) = self.index_of(pane) else {
+			return false;
+		};
 		if self.cells[lc].lc_type != LayoutType::WindowPane {
 			return false;
 		}
@@ -775,12 +819,18 @@ impl Layout {
 		let yoff = self.cells[lc].g.yoff;
 		let (size1, size2) = self.split_sizes(lc, size, false, lc_type);
 
-		let same_type_parent =
-			self.cells[lc].parent.map(|p| self.cells[p].lc_type == lc_type).unwrap_or(false);
+		let same_type_parent = self.cells[lc]
+			.parent
+			.map(|p| self.cells[p].lc_type == lc_type)
+			.unwrap_or(false);
 		let new_cell = if same_type_parent {
 			let parent = self.cells[lc].parent.unwrap();
 			let cell = self.create(Some(parent));
-			let pos = self.cells[parent].cells.iter().position(|c| *c == lc).unwrap();
+			let pos = self.cells[parent]
+				.cells
+				.iter()
+				.position(|c| *c == lc)
+				.unwrap();
 			self.cells[parent].cells.insert(pos + 1, cell);
 			cell
 		} else {
@@ -813,7 +863,10 @@ impl Layout {
 		if self.cells[idx].lc_type == LayoutType::WindowPane {
 			return (self.cells[idx].wp == Some(pane)).then_some(idx);
 		}
-		self.cells[idx].cells.iter().find_map(|child| self.index_of1(*child, pane))
+		self.cells[idx]
+			.cells
+			.iter()
+			.find_map(|child| self.index_of1(*child, pane))
 	}
 
 	/// Pixel rectangles in pane order, mapping cell geometry to the canvas.
@@ -943,8 +996,14 @@ mod tests {
 		assert!(layout.split_sized(0, 2, Dir::Down, 6));
 		let panes = layout.panes();
 		let by_id = |id| panes.iter().find(|(pane, _)| *pane == id).unwrap().1;
-		assert_eq!((by_id(0).xoff, by_id(0).yoff, by_id(0).sx, by_id(0).sy), (0, 0, 59, 17));
-		assert_eq!((by_id(2).xoff, by_id(2).yoff, by_id(2).sx, by_id(2).sy), (0, 18, 59, 6));
+		assert_eq!(
+			(by_id(0).xoff, by_id(0).yoff, by_id(0).sx, by_id(0).sy),
+			(0, 0, 59, 17)
+		);
+		assert_eq!(
+			(by_id(2).xoff, by_id(2).yoff, by_id(2).sx, by_id(2).sy),
+			(0, 18, 59, 6)
+		);
 	}
 
 	#[test]
@@ -1023,36 +1082,86 @@ mod tests {
 	fn tiled_two_panes_stack() {
 		let layout = Layout::tiled(&[0, 1], 80, 24);
 		let panes = layout.panes();
-		assert_eq!((panes[0].1.xoff, panes[0].1.yoff, panes[0].1.sx, panes[0].1.sy), (0, 0, 80, 11));
-		assert_eq!((panes[1].1.xoff, panes[1].1.yoff, panes[1].1.sx, panes[1].1.sy), (0, 12, 80, 12));
+		assert_eq!(
+			(
+				panes[0].1.xoff,
+				panes[0].1.yoff,
+				panes[0].1.sx,
+				panes[0].1.sy
+			),
+			(0, 0, 80, 11)
+		);
+		assert_eq!(
+			(
+				panes[1].1.xoff,
+				panes[1].1.yoff,
+				panes[1].1.sx,
+				panes[1].1.sy
+			),
+			(0, 12, 80, 12)
+		);
 	}
 
 	#[test]
 	fn tiled_three_panes_fill_a_second_row() {
 		let layout = Layout::tiled(&[0, 1, 2], 80, 24);
 		let panes = layout.panes();
-		assert_eq!((panes[0].1.xoff, panes[0].1.yoff, panes[0].1.sx, panes[0].1.sy), (0, 0, 39, 11));
-		assert_eq!((panes[1].1.xoff, panes[1].1.yoff, panes[1].1.sx, panes[1].1.sy), (40, 0, 40, 11));
-		assert_eq!((panes[2].1.xoff, panes[2].1.yoff, panes[2].1.sx, panes[2].1.sy), (0, 12, 80, 12));
+		assert_eq!(
+			(
+				panes[0].1.xoff,
+				panes[0].1.yoff,
+				panes[0].1.sx,
+				panes[0].1.sy
+			),
+			(0, 0, 39, 11)
+		);
+		assert_eq!(
+			(
+				panes[1].1.xoff,
+				panes[1].1.yoff,
+				panes[1].1.sx,
+				panes[1].1.sy
+			),
+			(40, 0, 40, 11)
+		);
+		assert_eq!(
+			(
+				panes[2].1.xoff,
+				panes[2].1.yoff,
+				panes[2].1.sx,
+				panes[2].1.sy
+			),
+			(0, 12, 80, 12)
+		);
 	}
 
 	#[test]
 	fn tiled_four_panes_are_a_two_by_two_grid() {
 		let layout = Layout::tiled(&[0, 1, 2, 3], 80, 24);
 		let panes = layout.panes();
-		let cells: Vec<(i32, i32, u32, u32)> =
-			panes.iter().map(|(_, g)| (g.xoff, g.yoff, g.sx, g.sy)).collect();
+		let cells: Vec<(i32, i32, u32, u32)> = panes
+			.iter()
+			.map(|(_, g)| (g.xoff, g.yoff, g.sx, g.sy))
+			.collect();
 		assert_eq!(
 			cells,
-			vec![(0, 0, 39, 11), (40, 0, 40, 11), (0, 12, 39, 12), (40, 12, 40, 12)]
+			vec![
+				(0, 0, 39, 11),
+				(40, 0, 40, 11),
+				(0, 12, 39, 12),
+				(40, 12, 40, 12)
+			]
 		);
 	}
 
 	#[test]
 	fn tiled_five_and_six_panes_use_three_rows() {
 		let five = Layout::tiled(&[0, 1, 2, 3, 4], 80, 24);
-		let cells: Vec<(i32, i32, u32, u32)> =
-			five.panes().iter().map(|(_, g)| (g.xoff, g.yoff, g.sx, g.sy)).collect();
+		let cells: Vec<(i32, i32, u32, u32)> = five
+			.panes()
+			.iter()
+			.map(|(_, g)| (g.xoff, g.yoff, g.sx, g.sy))
+			.collect();
 		assert_eq!(
 			cells,
 			vec![
@@ -1065,8 +1174,11 @@ mod tests {
 		);
 
 		let six = Layout::tiled(&[0, 1, 2, 3, 4, 5], 80, 24);
-		let cells: Vec<(i32, i32, u32, u32)> =
-			six.panes().iter().map(|(_, g)| (g.xoff, g.yoff, g.sx, g.sy)).collect();
+		let cells: Vec<(i32, i32, u32, u32)> = six
+			.panes()
+			.iter()
+			.map(|(_, g)| (g.xoff, g.yoff, g.sx, g.sy))
+			.collect();
 		assert_eq!(
 			cells,
 			vec![

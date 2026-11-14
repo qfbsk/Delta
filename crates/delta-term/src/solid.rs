@@ -7,6 +7,8 @@ use tree_sitter::Parser;
 use unicode_width::UnicodeWidthChar;
 
 use crate::canvas::{self, Canvas};
+use crate::clipboard;
+use crate::input::Key;
 use crate::layout::Rect;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -198,7 +200,8 @@ impl Editor {
 
 	pub fn undo(&mut self) {
 		if let Some((lines, cursor)) = self.undo.pop() {
-			self.redo.push((std::mem::replace(&mut self.lines, lines), self.cursor));
+			self.redo
+				.push((std::mem::replace(&mut self.lines, lines), self.cursor));
 			self.cursor = cursor;
 			self.anchor = None;
 			self.column_goal = None;
@@ -210,7 +213,8 @@ impl Editor {
 
 	pub fn redo(&mut self) {
 		if let Some((lines, cursor)) = self.redo.pop() {
-			self.undo.push((std::mem::replace(&mut self.lines, lines), self.cursor));
+			self.undo
+				.push((std::mem::replace(&mut self.lines, lines), self.cursor));
 			self.cursor = cursor;
 			self.anchor = None;
 			self.column_goal = None;
@@ -237,12 +241,18 @@ impl Editor {
 	}
 
 	pub fn selected_text(&self) -> String {
-		let Some((a, b)) = self.selection() else { return String::new() };
+		let Some((a, b)) = self.selection() else {
+			return String::new();
+		};
 		let mut out = String::new();
 		for row in a.0..=b.0 {
 			let line = &self.lines[row];
 			let from = if row == a.0 { a.1.min(line.len()) } else { 0 };
-			let to = if row == b.0 { b.1.min(line.len()) } else { line.len() };
+			let to = if row == b.0 {
+				b.1.min(line.len())
+			} else {
+				line.len()
+			};
 			out.extend(&line[from..to]);
 			if row != b.0 {
 				out.push('\n');
@@ -262,6 +272,9 @@ impl Editor {
 	}
 
 	pub fn cut(&mut self) -> String {
+		if self.read_only {
+			return String::new();
+		}
 		let text = self.selected_text();
 		if !text.is_empty() {
 			self.delete_selection();
@@ -270,7 +283,7 @@ impl Editor {
 	}
 
 	pub fn paste(&mut self, text: &str) {
-		if text.is_empty() {
+		if self.read_only || text.is_empty() {
 			return;
 		}
 		self.push_undo();
@@ -289,8 +302,20 @@ impl Editor {
 		self.hl_dirty = true;
 	}
 
+	pub fn paste_clipboard(&mut self) {
+		match clipboard::paste() {
+			Some(clipboard::Paste::Text(text)) => self.paste(&text),
+			Some(clipboard::Paste::Image(_)) => {
+				self.status = String::from("solid 只编辑文本；图片请在 even 或 AI 页面粘贴。");
+			}
+			None => {}
+		}
+	}
+
 	fn delete_selection_inner(&mut self) -> bool {
-		let Some((a, b)) = self.selection() else { return false };
+		let Some((a, b)) = self.selection() else {
+			return false;
+		};
 		let (mut ar, mut ac) = a;
 		let (br, mut bc) = b;
 		bc = bc.min(self.lines[br].len());
@@ -556,21 +581,135 @@ impl Editor {
 		format!("{} ({})", self.title(), self.lang.name())
 	}
 
+	/// solid's own key map. Delta only hands over the key; what Ctrl+C means
+	/// here is decided here.
+	pub fn key(&mut self, key: &Key) -> bool {
+		if !key.down {
+			return true;
+		}
+		let shift = key.shift;
+		let ctrl = key.ctrl && !key.alt;
+		match key.vk {
+			0x41 if ctrl => self.select_all(),
+			0x43 if ctrl => {
+				if self.has_selection() {
+					clipboard::set(&self.selected_text());
+				}
+			}
+			0x58 if ctrl => {
+				let text = self.cut();
+				if !text.is_empty() {
+					clipboard::set(&text);
+				}
+			}
+			0x56 if ctrl => self.paste_clipboard(),
+			0x5A if ctrl => {
+				if shift {
+					self.redo();
+				} else {
+					self.undo();
+				}
+			}
+			0x59 if ctrl => self.redo(),
+			0x53 if ctrl => {
+				if let Err(err) = self.save() {
+					self.status = format!("保存失败：{err}");
+				}
+			}
+			0x0D => self.split_line(),
+			0x08 => self.backspace(),
+			0x2E => self.delete(),
+			0x09 => self.insert('\t', false),
+			0x1B => {}
+			0x25 => {
+				if ctrl {
+					self.word_left(shift);
+				} else {
+					self.move_cursor(0, -1, shift);
+				}
+			}
+			0x27 => {
+				if ctrl {
+					self.word_right(shift);
+				} else {
+					self.move_cursor(0, 1, shift);
+				}
+			}
+			0x26 => self.move_cursor(-1, 0, shift),
+			0x28 => self.move_cursor(1, 0, shift),
+			0x24 => self.home(shift),
+			0x23 => self.end(shift),
+			0x21 => self.move_cursor(-10, 0, shift),
+			0x22 => self.move_cursor(10, 0, shift),
+			_ => {
+				if let Some(ch) = key.ch {
+					// AltGr arrives as Ctrl+Alt; it is still text input.
+					let text = !ch.is_control() && (!key.ctrl && !key.alt || key.right_alt);
+					if text {
+						self.insert(ch, false);
+					}
+				}
+			}
+		}
+		true
+	}
+
+	/// A click at a screen cell inside the editor.
+	pub fn click_screen(&mut self, screen_row: usize, screen_col: usize, extend: bool) {
+		let row = (self.scroll + screen_row).min(self.lines.len() - 1);
+		let col = self.column_at(row, screen_col + self.hscroll);
+		self.set_cursor(row, col, extend);
+	}
+
+	pub fn double_click_screen(&mut self, screen_row: usize, screen_col: usize) {
+		let row = (self.scroll + screen_row).min(self.lines.len() - 1);
+		let col = self.column_at(row, screen_col + self.hscroll);
+		self.select_word(row, col);
+	}
+
+	pub fn wheel(&mut self, lines: i32) {
+		self.move_cursor(lines, 0, false);
+	}
+
+	fn column_at(&self, row: usize, target_cell: usize) -> usize {
+		let Some(line) = self.lines.get(row) else {
+			return 0;
+		};
+		let mut cell = 0usize;
+		for (index, ch) in line.iter().enumerate() {
+			if cell >= target_cell {
+				return index;
+			}
+			cell += if *ch == '\t' {
+				4 - cell % 4
+			} else {
+				char_cells(*ch)
+			};
+		}
+		line.len()
+	}
+
 	pub fn highlight(&mut self) {
 		if !self.hl_dirty {
 			return;
 		}
 		self.hl_dirty = false;
 		let lines = self.lines.len();
-		self.hl = (0..lines).map(|i| vec![Hl::Plain; self.lines[i].len()]).collect();
-		let Some(language) = self.lang.language() else { return };
+		self.hl = (0..lines)
+			.map(|i| vec![Hl::Plain; self.lines[i].len()])
+			.collect();
+		let Some(language) = self.lang.language() else {
+			return;
+		};
 		let mut parser = Parser::new();
 		if parser.set_language(&language).is_err() {
 			return;
 		}
 		let src = self.text();
 		let bytes = src.as_bytes();
-		let Some(tree) = parser.parse(&src, None) else { return };
+		let Some(tree) = parser.parse(&src, None) else {
+			return;
+		};
 		let mut starts = Vec::with_capacity(lines);
 		let mut pos = 0usize;
 		for line in &self.lines {
@@ -580,7 +719,11 @@ impl Editor {
 		let linecol = |offset: usize| -> (usize, usize) {
 			let idx = starts.partition_point(|&s| s <= offset).saturating_sub(1);
 			let rel = offset.saturating_sub(starts.get(idx).copied().unwrap_or(0));
-			let text = &self.lines.get(idx).map(|l| l.iter().collect::<String>()).unwrap_or_default();
+			let text = &self
+				.lines
+				.get(idx)
+				.map(|l| l.iter().collect::<String>())
+				.unwrap_or_default();
 			let col = text.char_indices().take_while(|(b, _)| *b < rel).count();
 			(idx, col)
 		};
@@ -593,7 +736,11 @@ impl Editor {
 				for r in sr..=er.min(lines - 1) {
 					let line_len = self.hl[r].len();
 					let from = if r == sr { sc } else { 0 };
-					let to = if r == er { (ec + 1).min(line_len) } else { line_len };
+					let to = if r == er {
+						(ec + 1).min(line_len)
+					} else {
+						line_len
+					};
 					for c in from..to {
 						self.hl[r][c] = class;
 					}
@@ -616,9 +763,24 @@ impl Editor {
 		let footer = if self.status.is_empty() { 0 } else { 1 };
 		let rows = (total_rows - footer).max(1);
 		let cols = (area.width() / cw).max(1) as usize;
-		let bg = canvas::rgb(canvas::DEFAULT_BG.0, canvas::DEFAULT_BG.1, canvas::DEFAULT_BG.2);
-		canvas.fill(area.left, area.top, area.left + cols as i32 * cw, area.top + total_rows as i32 * ch, bg);
-		let saved = canvas.clip((area.left, area.top, area.left + cols as i32 * cw, area.top + total_rows as i32 * ch));
+		let bg = canvas::rgb(
+			canvas::DEFAULT_BG.0,
+			canvas::DEFAULT_BG.1,
+			canvas::DEFAULT_BG.2,
+		);
+		canvas.fill(
+			area.left,
+			area.top,
+			area.left + cols as i32 * cw,
+			area.top + total_rows as i32 * ch,
+			bg,
+		);
+		let saved = canvas.clip((
+			area.left,
+			area.top,
+			area.left + cols as i32 * cw,
+			area.top + total_rows as i32 * ch,
+		));
 
 		if self.cursor.0 < self.scroll {
 			self.scroll = self.cursor.0;
@@ -628,9 +790,17 @@ impl Editor {
 		}
 		let sel = self.selection();
 		let mut visual_col = 0usize;
-		for (i, c) in self.lines[self.cursor.0].iter().take(self.cursor.1).enumerate() {
+		for (i, c) in self.lines[self.cursor.0]
+			.iter()
+			.take(self.cursor.1)
+			.enumerate()
+		{
 			let _ = i;
-			visual_col += if *c == '\t' { 4 - visual_col % 4 } else { char_cells(*c) };
+			visual_col += if *c == '\t' {
+				4 - visual_col % 4
+			} else {
+				char_cells(*c)
+			};
 		}
 		if visual_col < self.hscroll {
 			self.hscroll = visual_col;
@@ -639,7 +809,11 @@ impl Editor {
 			self.hscroll = visual_col + 1 - cols;
 		}
 
-		let fg_plain = canvas::rgb(canvas::DEFAULT_FG.0, canvas::DEFAULT_FG.1, canvas::DEFAULT_FG.2);
+		let fg_plain = canvas::rgb(
+			canvas::DEFAULT_FG.0,
+			canvas::DEFAULT_FG.1,
+			canvas::DEFAULT_FG.2,
+		);
 		for row in 0..rows {
 			let line_idx = self.scroll + row;
 			if line_idx >= self.lines.len() {
@@ -663,16 +837,26 @@ impl Editor {
 					}
 					let width = char_cells(*c);
 					let mut fg = fg_plain;
-					let class = self.hl.get(line_idx).and_then(|l| l.get(ci)).copied().unwrap_or(Hl::Plain);
+					let class = self
+						.hl
+						.get(line_idx)
+						.and_then(|l| l.get(ci))
+						.copied()
+						.unwrap_or(Hl::Plain);
 					fg = hl_color(class, fg_plain);
-					let selected = sel.is_some_and(|(a, b)| (line_idx, ci) >= a && (line_idx, ci) < b);
+					let selected =
+						sel.is_some_and(|(a, b)| (line_idx, ci) >= a && (line_idx, ci) < b);
 					if selected {
 						canvas.fill(
 							area.left + screen_col as i32 * cw,
 							y,
 							area.left + (screen_col as i32 + width as i32) * cw,
 							y + ch,
-							canvas::rgb(canvas::SELECTION_BG.0, canvas::SELECTION_BG.1, canvas::SELECTION_BG.2),
+							canvas::rgb(
+								canvas::SELECTION_BG.0,
+								canvas::SELECTION_BG.1,
+								canvas::SELECTION_BG.2,
+							),
 						);
 					}
 					let is_cursor = focused && show_cursor && self.cursor == (line_idx, ci);
@@ -728,7 +912,11 @@ pub fn char_cells(c: char) -> usize {
 	c.width().unwrap_or(1).max(1)
 }
 
-fn hl_color(class: Hl, plain: windows_sys::Win32::Foundation::COLORREF) -> windows_sys::Win32::Foundation::COLORREF {	match class {
+fn hl_color(
+	class: Hl,
+	plain: windows_sys::Win32::Foundation::COLORREF,
+) -> windows_sys::Win32::Foundation::COLORREF {
+	match class {
 		Hl::Plain => plain,
 		Hl::Keyword => canvas::rgb(198, 146, 220),
 		Hl::String => canvas::rgb(152, 195, 121),
@@ -770,16 +958,32 @@ fn classify(node: tree_sitter::Node, source: &[u8]) -> Hl {
 	}
 	if kind == "identifier" || kind == "constant" {
 		let parent = node.parent().map(|p| p.kind()).unwrap_or("");
-		if parent == "call_expression" || parent == "function_item" || parent == "function_definition" {
+		if parent == "call_expression"
+			|| parent == "function_item"
+			|| parent == "function_definition"
+		{
 			if let Some(parent) = node.parent() {
-				if parent.child_by_field_name("function").map(|f| f.id() == node.id()).unwrap_or(false)
-					|| parent.child_by_field_name("name").map(|f| f.id() == node.id()).unwrap_or(false)
+				if parent
+					.child_by_field_name("function")
+					.map(|f| f.id() == node.id())
+					.unwrap_or(false)
+					|| parent
+						.child_by_field_name("name")
+						.map(|f| f.id() == node.id())
+						.unwrap_or(false)
 				{
 					return Hl::Function;
 				}
 			}
 		}
-		if node.utf8_text(source).map(|t| t.chars().all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit())).unwrap_or(false) {
+		if node
+			.utf8_text(source)
+			.map(|t| {
+				t.chars()
+					.all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit())
+			})
+			.unwrap_or(false)
+		{
 			return Hl::Constant;
 		}
 	}
@@ -789,19 +993,74 @@ fn classify(node: tree_sitter::Node, source: &[u8]) -> Hl {
 fn is_keyword(text: &str) -> bool {
 	matches!(
 		text,
-		"fn" | "let" | "mut" | "pub" | "use" | "mod" | "impl" | "struct" | "enum" | "trait"
-			| "for" | "while" | "loop" | "if" | "else" | "match" | "return" | "break" | "continue"
-			| "const" | "static" | "unsafe" | "where" | "as" | "in" | "ref" | "move" | "async"
-			| "await" | "dyn" | "crate" | "self" | "Self" | "super" | "def" | "class" | "import"
-			| "from" | "lambda" | "pass" | "raise" | "try" | "except" | "finally" | "with" | "yield"
-			| "global" | "nonlocal" | "assert" | "del" | "not" | "and" | "or" | "is" | "None"
-			| "True" | "False" | "function" | "var" | "new" | "this" | "typeof" | "instanceof"
-			| "void" | "delete" | "throw" | "catch" | "switch" | "case" | "default" | "extends"
-			| "static" | "public" | "private" | "protected" | "interface" | "type" | "namespace"
-			| "template" | "typename" | "virtual" | "operator" | "friend" | "using" | "nullptr"
-			| "true" | "false" | "null" | "undefined" | "int" | "char" | "float" | "double"
-			| "long" | "short" | "signed" | "unsigned" | "bool" | "wchar_t" | "auto" | "extern"
-			| "register" | "volatile" | "sizeof" | "goto" | "do" | "export" | "package"
+		"fn" | "let"
+			| "mut" | "pub"
+			| "use" | "mod"
+			| "impl" | "struct"
+			| "enum" | "trait"
+			| "for" | "while"
+			| "loop" | "if"
+			| "else" | "match"
+			| "return"
+			| "break" | "continue"
+			| "const" | "static"
+			| "unsafe"
+			| "where" | "as"
+			| "in" | "ref"
+			| "move" | "async"
+			| "await" | "dyn"
+			| "crate" | "self"
+			| "Self" | "super"
+			| "def" | "class"
+			| "import"
+			| "from" | "lambda"
+			| "pass" | "raise"
+			| "try" | "except"
+			| "finally"
+			| "with" | "yield"
+			| "global"
+			| "nonlocal"
+			| "assert"
+			| "del" | "not"
+			| "and" | "or"
+			| "is" | "None"
+			| "True" | "False"
+			| "function"
+			| "var" | "new"
+			| "this" | "typeof"
+			| "instanceof"
+			| "void" | "delete"
+			| "throw" | "catch"
+			| "switch"
+			| "case" | "default"
+			| "extends"
+			| "static"
+			| "public"
+			| "private"
+			| "protected"
+			| "interface"
+			| "type" | "namespace"
+			| "template"
+			| "typename"
+			| "virtual"
+			| "operator"
+			| "friend"
+			| "using" | "nullptr"
+			| "true" | "false"
+			| "null" | "undefined"
+			| "int" | "char"
+			| "float" | "double"
+			| "long" | "short"
+			| "signed"
+			| "unsigned"
+			| "bool" | "wchar_t"
+			| "auto" | "extern"
+			| "register"
+			| "volatile"
+			| "sizeof"
+			| "goto" | "do"
+			| "export"
+			| "package"
 	)
 }
 

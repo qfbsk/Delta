@@ -2,24 +2,41 @@
 //! b0c34b7 (`win.rs::init_gdi`) and Windows Terminal's GDI fallback shape,
 //! but everything is drawn from the delta-vt grid each frame.
 
+use std::collections::HashMap;
 use std::mem::zeroed;
-use std::ptr::{null_mut};
+use std::ptr::null_mut;
 
+use windows_sys::Win32::Foundation::SIZE;
 use windows_sys::Win32::Foundation::{COLORREF, HWND, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
 	BitBlt, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateCompatibleBitmap, CreateCompatibleDC,
 	CreateFontW, CreatePen, CreateSolidBrush, DEFAULT_CHARSET, DeleteDC, DeleteObject, FF_MODERN,
 	FIXED_PITCH, FW_NORMAL, FillRect, GetDC, GetTextExtentPoint32W, HDC, HFONT, HGDIOBJ,
 	IntersectClipRect, LineTo, MoveToEx, OUT_DEFAULT_PRECIS, PS_SOLID, Rectangle, ReleaseDC,
-	RestoreDC, SRCCOPY, SaveDC, SelectObject, SetBkMode, SetTextColor, TextOutW, TRANSPARENT,
+	RestoreDC, SRCCOPY, SaveDC, SelectObject, SetBkMode, SetTextColor, TRANSPARENT, TextOutW,
 };
-use windows_sys::Win32::Foundation::SIZE;
 
+/// The size every pane starts at; status bar, borders and modals always use it.
+pub const FONT_SIZE: i32 = 16;
+/// Ctrl+= / Ctrl+- stop here. Below 8 the glyphs collapse; above 96 one cell is
+/// wider than a pane on a normal screen.
+pub const MIN_FONT_SIZE: i32 = 8;
+pub const MAX_FONT_SIZE: i32 = 96;
+
+#[derive(Clone, Copy)]
+struct Face {
+	font: HFONT,
+	cell_w: i32,
+	cell_h: i32,
+}
 pub struct Canvas {
 	pub mem: HDC,
 	bmp: windows_sys::Win32::Graphics::Gdi::HBITMAP,
 	old: HGDIOBJ,
-	font: HFONT,
+	face: &'static str,
+	faces: HashMap<i32, Face>,
+	/// Font size currently selected; `cell_w`/`cell_h` belong to it.
+	pub font_size: i32,
 	pub cell_w: i32,
 	pub cell_h: i32,
 	pub width: i32,
@@ -39,9 +56,38 @@ impl Canvas {
 				ReleaseDC(hwnd, screen);
 				return None;
 			}
-			let face = wide(pick_font());
+			ReleaseDC(hwnd, screen);
+			let mut canvas = Self {
+				mem,
+				bmp: null_mut(),
+				old: null_mut(),
+				face: pick_font(),
+				faces: HashMap::new(),
+				font_size: FONT_SIZE,
+				cell_w: 8,
+				cell_h: 16,
+				width: 0,
+				height: 0,
+				bg: 0,
+			};
+			let face = canvas.face_for(FONT_SIZE);
+			SelectObject(mem, face.font as HGDIOBJ);
+			SetBkMode(mem, TRANSPARENT as i32);
+			canvas.cell_w = face.cell_w;
+			canvas.cell_h = face.cell_h;
+			Some(canvas)
+		}
+	}
+
+	/// The font for `size`, created and measured on the memory DC on first use.
+	fn face_for(&mut self, size: i32) -> Face {
+		if let Some(face) = self.faces.get(&size) {
+			return *face;
+		}
+		unsafe {
+			let name = wide(self.face);
 			let font = CreateFontW(
-				-16,
+				-size,
 				0,
 				0,
 				0,
@@ -54,28 +100,49 @@ impl Canvas {
 				CLIP_DEFAULT_PRECIS as u32,
 				CLEARTYPE_QUALITY as u32,
 				(FIXED_PITCH | FF_MODERN) as u32,
-				face.as_ptr(),
+				name.as_ptr(),
 			);
-			SelectObject(mem, font as HGDIOBJ);
-			SetBkMode(mem, TRANSPARENT as i32);
-			ReleaseDC(hwnd, screen);
-			let mut size: SIZE = zeroed();
+			let old = SelectObject(self.mem, font as HGDIOBJ);
+			let mut measured: SIZE = zeroed();
 			let m = wide("M");
-			let ok = GetTextExtentPoint32W(mem, m.as_ptr(), 1, &mut size);
-			let cell_w = if ok != 0 && size.cx > 0 { size.cx } else { 8 };
-			let cell_h = if ok != 0 && size.cy > 0 { size.cy } else { 16 };
-			Some(Self {
-				mem,
-				bmp: null_mut(),
-				old: null_mut(),
+			let ok = GetTextExtentPoint32W(self.mem, m.as_ptr(), 1, &mut measured);
+			SelectObject(self.mem, old);
+			let cell_w = if ok != 0 && measured.cx > 0 {
+				measured.cx
+			} else {
+				8
+			};
+			let cell_h = if ok != 0 && measured.cy > 0 {
+				measured.cy
+			} else {
+				size.max(1)
+			};
+			let face = Face {
 				font,
 				cell_w,
 				cell_h,
-				width: 0,
-				height: 0,
-				bg: 0,
-			})
+			};
+			self.faces.insert(size, face);
+			face
 		}
+	}
+
+	/// Cell size for `size`, creating the font if this is the first use.
+	pub fn metrics(&mut self, size: i32) -> (i32, i32) {
+		let face = self.face_for(size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE));
+		(face.cell_w, face.cell_h)
+	}
+
+	/// Draw from here on with the font for `size`; cell sizes follow it.
+	pub fn select_font(&mut self, size: i32) {
+		let size = size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
+		let face = self.face_for(size);
+		unsafe {
+			SelectObject(self.mem, face.font as HGDIOBJ);
+		}
+		self.font_size = size;
+		self.cell_w = face.cell_w;
+		self.cell_h = face.cell_h;
 	}
 
 	pub fn resize(&mut self, hwnd: HWND, width: i32, height: i32) {
@@ -90,7 +157,9 @@ impl Canvas {
 			let mem = CreateCompatibleDC(screen);
 			let bmp = CreateCompatibleBitmap(screen, width, height);
 			let old = SelectObject(mem, bmp);
-			SelectObject(mem, self.font as HGDIOBJ);
+			if let Some(face) = self.faces.get(&self.font_size) {
+				SelectObject(mem, face.font as HGDIOBJ);
+			}
 			SetBkMode(mem, TRANSPARENT as i32);
 			ReleaseDC(hwnd, screen);
 			if !self.bmp.is_null() {
@@ -110,7 +179,12 @@ impl Canvas {
 
 	pub fn clear(&self) {
 		unsafe {
-			let rect = RECT { left: 0, top: 0, right: self.width, bottom: self.height };
+			let rect = RECT {
+				left: 0,
+				top: 0,
+				right: self.width,
+				bottom: self.height,
+			};
 			let brush = CreateSolidBrush(self.bg);
 			FillRect(self.mem, &rect, brush);
 			DeleteObject(brush);
@@ -122,7 +196,12 @@ impl Canvas {
 			return;
 		}
 		unsafe {
-			let rect = RECT { left, top, right, bottom };
+			let rect = RECT {
+				left,
+				top,
+				right,
+				bottom,
+			};
 			let brush = CreateSolidBrush(color);
 			FillRect(self.mem, &rect, brush);
 			DeleteObject(brush);
@@ -182,7 +261,17 @@ impl Canvas {
 		unsafe {
 			let screen = GetDC(hwnd);
 			if !screen.is_null() {
-				BitBlt(screen, 0, 0, self.width, self.height, self.mem, 0, 0, SRCCOPY);
+				BitBlt(
+					screen,
+					0,
+					0,
+					self.width,
+					self.height,
+					self.mem,
+					0,
+					0,
+					SRCCOPY,
+				);
 				ReleaseDC(hwnd, screen);
 			}
 		}
@@ -196,8 +285,10 @@ impl Drop for Canvas {
 				SelectObject(self.mem, self.old);
 				DeleteObject(self.bmp);
 			}
-			if !self.font.is_null() {
-				DeleteObject(self.font);
+			for (_, face) in self.faces.drain() {
+				if !face.font.is_null() {
+					DeleteObject(face.font);
+				}
 			}
 			if !self.mem.is_null() {
 				DeleteDC(self.mem);
@@ -278,7 +369,11 @@ pub fn colorref(c: delta_vt::Color, bold: bool, background: bool) -> COLORREF {
 		Color::Rgb(r, g, b) => (r, g, b),
 	};
 	if bold && !background {
-		rgb(r.saturating_add(24), g.saturating_add(24), b.saturating_add(24))
+		rgb(
+			r.saturating_add(24),
+			g.saturating_add(24),
+			b.saturating_add(24),
+		)
 	} else {
 		rgb(r, g, b)
 	}
@@ -322,4 +417,3 @@ fn indexed(n: u8, bold: bool) -> (u8, u8, u8) {
 		(v, v, v)
 	}
 }
-

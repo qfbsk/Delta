@@ -133,7 +133,9 @@ impl TerminalPane {
 	pub fn drain(&mut self) -> bool {
 		self.data_posted.store(false, Ordering::SeqCst);
 		let bytes = {
-			let Ok(mut q) = self.queue.lock() else { return false };
+			let Ok(mut q) = self.queue.lock() else {
+				return false;
+			};
 			if q.is_empty() {
 				return false;
 			}
@@ -192,6 +194,21 @@ impl TerminalPane {
 		self.scroll = self.scroll.min(self.max_scroll());
 	}
 
+	/// Key-down and key-up exactly as the program asked to receive them. Nothing
+	/// here decides what a key means; the program does.
+	pub fn key(&mut self, key: &crate::input::Key) {
+		let bytes = crate::input::encode(
+			key,
+			self.screen.modes.win32_input,
+			self.screen.modes.kitty_flags,
+			self.screen.modes.cursor_keys,
+			self.screen.modes.newline_mode,
+		);
+		if !bytes.is_empty() {
+			self.write(&bytes);
+		}
+	}
+
 	pub fn paste(&self, text: &str) {
 		let mut out = String::new();
 		if self.screen.modes.bracketed_paste {
@@ -228,9 +245,19 @@ impl TerminalPane {
 		if sel.alt {
 			let mut out = String::new();
 			for r in a.row..=b.row {
-				let Some(row) = self.screen.alt_row(r) else { continue };
-				let from = if r == a.row { a.col.min(row.cells.len()) } else { 0 };
-				let to = if r == b.row { (b.col + 1).min(row.cells.len()) } else { row.cells.len() };
+				let Some(row) = self.screen.alt_row(r) else {
+					continue;
+				};
+				let from = if r == a.row {
+					a.col.min(row.cells.len())
+				} else {
+					0
+				};
+				let to = if r == b.row {
+					(b.col + 1).min(row.cells.len())
+				} else {
+					row.cells.len()
+				};
 				for c in &row.cells[from..to] {
 					if c.wide == 2 {
 						continue;
@@ -285,27 +312,45 @@ impl TerminalPane {
 		let cols = (area.width() / cw).max(1) as usize;
 		let rows = (area.height() / ch).max(1) as usize;
 		let (width, height) = (cols as i32 * cw, rows as i32 * ch);
-		let default_bg = canvas::rgb(canvas::DEFAULT_BG.0, canvas::DEFAULT_BG.1, canvas::DEFAULT_BG.2);
-		canvas.fill(area.left, area.top, area.left + width, area.top + height, default_bg);
+		let default_bg = canvas::rgb(
+			canvas::DEFAULT_BG.0,
+			canvas::DEFAULT_BG.1,
+			canvas::DEFAULT_BG.2,
+		);
+		canvas.fill(
+			area.left,
+			area.top,
+			area.left + width,
+			area.top + height,
+			default_bg,
+		);
 		let saved = canvas.clip((area.left, area.top, area.left + width, area.top + height));
 		let (cc, cr) = self.screen.cursor();
-		let cursor_abs = if self.alt { cr } else { self.screen.scrollback_len() + cr };
-		let sel = self
-			.selection
-			.filter(|s| s.alt == self.alt && (s.anchor.row, s.anchor.col) != (s.cursor.row, s.cursor.col));
+		let cursor_abs = if self.alt {
+			cr
+		} else {
+			self.screen.scrollback_len() + cr
+		};
+		let sel = self.selection.filter(|s| {
+			s.alt == self.alt && (s.anchor.row, s.anchor.col) != (s.cursor.row, s.cursor.col)
+		});
 
 		for row in 0..rows {
 			let abs = self.view_top() + row;
-			let Some(line) = self.row_at(abs) else { continue };
+			let Some(line) = self.row_at(abs) else {
+				continue;
+			};
 			let y = area.top + row as i32 * ch;
 			for col in 0..cols {
-				let Some(cell) = line.cells.get(col) else { continue };
+				let Some(cell) = line.cells.get(col) else {
+					continue;
+				};
 				let mut fg = cell.fg;
 				let mut bg = cell.bg;
 				let bold = cell.attrs & delta_vt::ATTR_BOLD != 0;
 				let dim = cell.attrs & delta_vt::ATTR_DIM != 0;
-				let reverse = cell.attrs & delta_vt::ATTR_REVERSE != 0
-					|| self.screen.modes.reverse_video;
+				let reverse =
+					cell.attrs & delta_vt::ATTR_REVERSE != 0 || self.screen.modes.reverse_video;
 				if reverse {
 					std::mem::swap(&mut fg, &mut bg);
 					if fg == Color::Default {
@@ -393,7 +438,13 @@ impl TerminalPane {
 		if let Some(n) = pane_number {
 			let label = format!(" {n} ");
 			let w = label.len() as i32 * cw;
-			canvas.fill(area.left, area.top, area.left + w, area.top + ch, canvas::rgb(60, 70, 90));
+			canvas.fill(
+				area.left,
+				area.top,
+				area.left + w,
+				area.top + ch,
+				canvas::rgb(60, 70, 90),
+			);
 			canvas.text(area.left, area.top, &label, canvas::rgb(240, 240, 240));
 		}
 		canvas.unclip(saved);

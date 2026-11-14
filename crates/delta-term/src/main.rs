@@ -3,6 +3,7 @@
 
 mod app;
 mod canvas;
+mod clipboard;
 mod even;
 mod input;
 mod layout;

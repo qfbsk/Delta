@@ -6,46 +6,49 @@ use std::collections::HashMap;
 use std::mem::zeroed;
 use std::path::PathBuf;
 use std::ptr::{null, null_mut};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use delta_vt::{MouseEncoding, MouseMode};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Graphics::Gdi::{
+	BeginPaint, EndPaint, PAINTSTRUCT, ScreenToClient, UpdateWindow,
+};
 use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::UI::Controls::Dialogs::{
+	GetOpenFileNameW, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST,
+	OPENFILENAMEW,
+};
 use windows_sys::Win32::UI::HiDpi::{
-	SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+	DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
 use windows_sys::Win32::UI::Input::Ime::{
+	CANDIDATEFORM, CFS_EXCLUDE, CFS_POINT, COMPOSITIONFORM, GCS_COMPSTR, GCS_RESULTSTR,
 	ImmGetCompositionStringW, ImmGetContext, ImmReleaseContext, ImmSetCandidateWindow,
-	ImmSetCompositionWindow, CANDIDATEFORM, COMPOSITIONFORM, CFS_EXCLUDE, CFS_POINT,
-	GCS_COMPSTR, GCS_RESULTSTR,
+	ImmSetCompositionWindow,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 	GetKeyState, GetKeyboardLayout, GetKeyboardState, ReleaseCapture, SetCapture, ToUnicodeEx,
-	VK_CAPITAL, VK_CONTROL, VK_ESCAPE, VK_F1, VK_MENU, VK_NUMLOCK, VK_RCONTROL, VK_RMENU,
-	VK_SHIFT,
-};
-use windows_sys::Win32::Graphics::Gdi::{
-	BeginPaint, EndPaint, ScreenToClient, UpdateWindow, PAINTSTRUCT,
+	VK_CAPITAL, VK_CONTROL, VK_ESCAPE, VK_F1, VK_MENU, VK_NUMLOCK, VK_RCONTROL, VK_RMENU, VK_SHIFT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-	CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW, GetClientRect,
-	GetForegroundWindow, GetMessageW, GetWindowLongPtrW, LoadCursorW, PostQuitMessage,
-	RegisterClassW, SendMessageW, SetTimer, SetWindowLongPtrW, ShowWindow, TranslateMessage,
-	UnregisterClassW,
-	CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, IDC_ARROW,
-	MSG, SW_SHOW, WM_APP, WM_CHAR, WM_CLOSE, WM_COPYDATA, WM_DESTROY, WM_ERASEBKGND, WM_IME_CHAR,
-	WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP,
-	WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-	WM_PAINT, WM_SETFOCUS, WM_SIZE, WM_SYSCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW,
-	WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+	CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW,
+	DestroyWindow, DispatchMessageW, FindWindowW, GWLP_USERDATA, GetClientRect,
+	GetForegroundWindow, GetMessageW, GetWindowLongPtrW, IDC_ARROW, LoadCursorW, MSG,
+	PostQuitMessage, RegisterClassW, SW_SHOW, SendMessageW, SetTimer, SetWindowLongPtrW,
+	ShowWindow, TranslateMessage, UnregisterClassW, WM_APP, WM_CHAR, WM_CLOSE, WM_COPYDATA,
+	WM_DESTROY, WM_ERASEBKGND, WM_IME_CHAR, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION,
+	WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+	WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_SETFOCUS, WM_SIZE, WM_SYSCHAR,
+	WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 
 use crate::canvas::{self, Canvas};
+use crate::clipboard;
 use crate::even::{EvenEvent, GroupPane};
-use crate::input::{self, Key};
+use crate::input::Key;
 use crate::layout::{Dir, Layout, LayoutType, PaneId, Rect};
 use crate::mcp::{self, McpServer};
 use crate::opencode::Client;
@@ -56,12 +59,13 @@ const WM_DELTA_DATA: u32 = WM_APP + 10;
 const WM_DELTA_EXIT: u32 = WM_APP + 11;
 const COPYDATA_TAG: usize = 0x4445_4C54;
 const TIMER_ID: usize = 1;
+/// The `p` popup keeps this many window rows; the wheel scrolls the rest.
+const PANE_LIST_ROWS: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
 	Normal,
 	Insert,
-	Replace,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -74,7 +78,14 @@ enum Owner {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EventKind {
 	AiTask,
+	/// An AI edit of the file behind a solid window. The write itself is
+	/// synchronous; the event lingers briefly so the human sees the file
+	/// changed and the window cannot close under it.
+	AiEdit,
 }
+
+/// How long an AI edit event stays bound to its window after the write.
+const AI_EDIT_EVENT_TTL: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 struct EventRecord {
@@ -102,6 +113,10 @@ struct Pane {
 	title: Option<String>,
 	group_id: u64,
 	member: Option<String>,
+	/// Point size of this window's own font, changed by Ctrl+= / Ctrl+-.
+	font: i32,
+	/// Cell size that goes with `font`, as measured by the canvas.
+	cell: (i32, i32),
 }
 
 struct Tab {
@@ -131,7 +146,7 @@ enum Modal {
 	Takeover { pane: PaneId, agent: String },
 	Tabs,
 	CloseAgent { pane: PaneId, agent: String },
-	PaneLimit,
+	PaneLimit { scroll: isize },
 	Notice(String),
 }
 
@@ -152,6 +167,9 @@ pub struct App {
 	next_group: u64,
 	mode: Mode,
 	scroll_mode: bool,
+	/// Wheel deltas arrive in fractions of 120 on high-resolution mice; they
+	/// accumulate here until a whole notch is worth acting on.
+	wheel_accum: i32,
 	show_numbers: bool,
 	modal: Option<Modal>,
 	events: Vec<EventRecord>,
@@ -280,7 +298,9 @@ impl App {
 		if let Ok(exe) = std::env::current_exe() {
 			if let Some(dir) = exe.parent() {
 				let mut paths = vec![dir.to_path_buf()];
-				paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
+				paths.extend(std::env::split_paths(
+					&std::env::var_os("PATH").unwrap_or_default(),
+				));
 				if let Ok(path) = std::env::join_paths(paths) {
 					child_env.push((String::from("PATH"), path.to_string_lossy().into_owned()));
 				}
@@ -304,6 +324,7 @@ impl App {
 			next_group: 1,
 			mode: Mode::Insert,
 			scroll_mode: false,
+			wheel_accum: 0,
 			show_numbers: false,
 			modal: None,
 			events: Vec::new(),
@@ -430,13 +451,39 @@ impl App {
 				0
 			}
 			WM_MOUSEWHEEL => {
-				let delta = ((wparam >> 16) & 0xffff) as i16 as i32 / 120;
-				let (sx, sy) = point_of(lparam);
-				let mut point = POINT { x: sx, y: sy };
-				unsafe {
-					ScreenToClient(hwnd, &mut point);
+				let raw = ((wparam >> 16) & 0xffff) as i16 as i32;
+				if raw != 0 {
+					// Drivers report high-resolution wheels in fractions of
+					// WHEEL_DELTA; dropping those fractions makes smooth mice
+					// look dead. Keep the remainder until a notch is whole.
+					if raw.signum() != self.wheel_accum.signum() {
+						self.wheel_accum = 0;
+					}
+					self.wheel_accum += raw;
 				}
-				self.mouse_wheel(point.x, point.y, delta);
+				let notches = self.wheel_accum / 120;
+				if notches != 0 {
+					self.wheel_accum -= notches * 120;
+					let (sx, sy) = point_of(lparam);
+					let mut point = POINT { x: sx, y: sy };
+					unsafe {
+						ScreenToClient(hwnd, &mut point);
+					}
+					let ctrl = unsafe { GetKeyState(VK_CONTROL as i32) < 0 };
+					if ctrl
+						&& !self.scroll_mode
+						&& self.mode == Mode::Normal
+						&& self.modal.is_none()
+					{
+						if let Some(id) =
+							self.mouse_target(point.x, point.y).or_else(|| self.focused_id())
+						{
+							self.zoom_font_at(id, notches * 2);
+						}
+					} else {
+						self.mouse_wheel(point.x, point.y, notches);
+					}
+				}
 				0
 			}
 			WM_CLOSE => {
@@ -455,7 +502,11 @@ impl App {
 	}
 
 	fn tick(&mut self) {
-		let ids: Vec<PaneId> = self.tabs.iter().flat_map(|t| t.panes.keys().copied()).collect();
+		let ids: Vec<PaneId> = self
+			.tabs
+			.iter()
+			.flat_map(|t| t.panes.keys().copied())
+			.collect();
 		let mut ended = Vec::new();
 		let mut finished = Vec::new();
 		for id in ids {
@@ -482,7 +533,7 @@ impl App {
 		self.sync_events();
 		self.handle_mcp();
 		self.mark_seen();
-		self.sync_keyboard_mode();
+		self.sync_owner_to_mode();
 		self.paint();
 	}
 
@@ -501,7 +552,10 @@ impl App {
 	/// Agent- and share-owned panes stay so their owner can still see what happened
 	/// and close them through the usual rule.
 	fn term_exit(&mut self, id: PaneId) {
-		let normal = self.pane(id).map(|pane| matches!(pane.owner, Owner::Normal)).unwrap_or(false);
+		let normal = self
+			.pane(id)
+			.map(|pane| matches!(pane.owner, Owner::Normal))
+			.unwrap_or(false);
 		if normal && !self.events.iter().any(|e| e.pane == id) {
 			self.remove_pane_direct(id);
 			return;
@@ -524,11 +578,15 @@ impl App {
 		let area = self.content_area();
 		let cw = self.canvas.cell_w.max(1);
 		let ch = self.canvas.cell_h.max(1);
-		((area.width() / cw).max(1) as u32, (area.height() / ch).max(1) as u32)
+		(
+			(area.width() / cw).max(1) as u32,
+			(area.height() / ch).max(1) as u32,
+		)
 	}
 
 	fn rects_of(&self, tab: &Tab, area: Rect) -> Vec<(PaneId, Rect)> {
-		tab.layout.rects(area, self.canvas.cell_w.max(1), self.canvas.cell_h.max(1))
+		tab.layout
+			.rects(area, self.canvas.cell_w.max(1), self.canvas.cell_h.max(1))
 	}
 
 	fn pane(&self, id: PaneId) -> Option<&Pane> {
@@ -565,7 +623,10 @@ impl App {
 			return None;
 		}
 		let area = self.content_area();
-		self.rects_of(tab, area).into_iter().find(|(p, _)| *p == id).map(|(_, r)| r)
+		self.rects_of(tab, area)
+			.into_iter()
+			.find(|(p, _)| *p == id)
+			.map(|(_, r)| r)
 	}
 
 	fn mark_seen(&mut self) {
@@ -586,42 +647,62 @@ impl App {
 		}
 	}
 
-	/// Agent is the AI window's normal, share its insert; whichever way focus
-	/// arrived, the keyboard mode must match the window mode.
-	fn sync_keyboard_mode(&mut self) {
-		if self.scroll_mode {
+	/// Agent is the AI window's normal, share its insert. The keyboard mode is
+	/// the human's choice and never depends on who holds the window; only the
+	/// label and the permission layer follow the owner. So the owner is brought
+	/// in line with the mode, never the other way round.
+	fn sync_owner_to_mode(&mut self) {
+		let mode = self.mode;
+		let Some(pane) = self.focused_mut() else {
 			return;
-		}
-		let Some(owner) = self.focused().map(|pane| pane.owner.clone()) else { return };
-		let want = match owner {
-			Owner::Agent(_) => Mode::Normal,
-			Owner::Share(_) => Mode::Insert,
-			Owner::Normal => return,
 		};
-		if self.mode != want {
-			self.mode = want;
+		match pane.owner.clone() {
+			Owner::Agent(agent) if mode == Mode::Insert => pane.owner = Owner::Share(agent),
+			Owner::Share(agent) if mode == Mode::Normal => pane.owner = Owner::Agent(agent),
+			_ => {}
 		}
 	}
 
 	fn resize_panes(&mut self) {
 		let area = self.content_area();
-		let cw = self.canvas.cell_w.max(1);
-		let ch = self.canvas.cell_h.max(1);
+		let base_w = self.canvas.cell_w.max(1);
+		let base_h = self.canvas.cell_h.max(1);
 		let (cols, rows) = self.content_cells();
+		let mut sizes: Vec<i32> = self
+			.tabs
+			.iter()
+			.flat_map(|t| t.panes.values().map(|p| p.font))
+			.collect();
+		sizes.sort_unstable();
+		sizes.dedup();
+		let metrics: Vec<(i32, (i32, i32))> = sizes
+			.into_iter()
+			.map(|size| (size, self.canvas.metrics(size)))
+			.collect();
 		for tab in &mut self.tabs {
 			tab.layout.resize(cols, rows);
 			if let Some(saved) = &mut tab.saved {
 				saved.resize(cols, rows);
 			}
-			for (id, rect) in tab.layout.rects(area, cw, ch) {
+			for (id, rect) in tab.layout.rects(area, base_w, base_h) {
 				if let Some(pane) = tab.panes.get_mut(&id) {
-					resize_body(&mut pane.body, &rect, cw, ch);
+					let (cw, ch) = metrics
+						.iter()
+						.find(|(size, _)| *size == pane.font)
+						.map(|(_, cells)| *cells)
+						.unwrap_or((base_w, base_h));
+					pane.cell = (cw.max(1), ch.max(1));
+					resize_body(&mut pane.body, &rect, cw.max(1), ch.max(1));
 				}
 			}
 		}
 	}
 
-	fn spawn_term(&mut self, command: &str, envs: &[(String, String)]) -> Option<(PaneId, TerminalPane)> {
+	fn spawn_term(
+		&mut self,
+		command: &str,
+		envs: &[(String, String)],
+	) -> Option<(PaneId, TerminalPane)> {
 		let id = self.next_pane;
 		match TerminalPane::new(80, 24, command, envs) {
 			Ok(mut term) => {
@@ -639,7 +720,9 @@ impl App {
 	fn new_terminal_tab(&mut self) {
 		let command = self.shell.clone();
 		let envs = self.child_env.clone();
-		let Some((id, term)) = self.spawn_term(&command, &envs) else { return };
+		let Some((id, term)) = self.spawn_term(&command, &envs) else {
+			return;
+		};
 		self.add_tab(id, Body::Term(term), Owner::Normal, false, 0, None, true);
 	}
 
@@ -655,7 +738,16 @@ impl App {
 	) -> Option<PaneId> {
 		let envs = self.child_env.clone();
 		let (id, term) = self.spawn_term(command, &envs)?;
-		self.add_pane(tab, id, Body::Term(term), owner, ai_created, group, member, focus_new);
+		self.add_pane(
+			tab,
+			id,
+			Body::Term(term),
+			owner,
+			ai_created,
+			group,
+			member,
+			focus_new,
+		);
 		Some(id)
 	}
 
@@ -672,10 +764,29 @@ impl App {
 		focus_new: bool,
 	) {
 		let (cols, rows) = self.content_cells();
-		let pane = Pane { id, body, owner, seen: false, ai_created, creator: None, title: None, group_id: group, member };
+		let cell = (self.canvas.cell_w.max(1), self.canvas.cell_h.max(1));
+		let pane = Pane {
+			id,
+			body,
+			owner,
+			seen: false,
+			ai_created,
+			creator: None,
+			title: None,
+			group_id: group,
+			member,
+			font: canvas::FONT_SIZE,
+			cell,
+		};
 		let mut panes = HashMap::new();
 		panes.insert(id, pane);
-		self.tabs.push(Tab { layout: Layout::new(id, cols, rows), saved: None, panes, focus: id, hidden: Vec::new() });
+		self.tabs.push(Tab {
+			layout: Layout::new(id, cols, rows),
+			saved: None,
+			panes,
+			focus: id,
+			hidden: Vec::new(),
+		});
 		if focus_new {
 			self.active = self.tabs.len() - 1;
 			// The window was created in order to be used; typing goes into it.
@@ -704,14 +815,35 @@ impl App {
 		focus_new: bool,
 	) {
 		let (cols, rows) = self.content_cells();
-		let pane = Pane { id, body, owner, seen: false, ai_created, creator: None, title: None, group_id: group, member };
-		let Some(tab) = self.tabs.get(tab_index) else { return };
+		let cell = (self.canvas.cell_w.max(1), self.canvas.cell_h.max(1));
+		let pane = Pane {
+			id,
+			body,
+			owner,
+			seen: false,
+			ai_created,
+			creator: None,
+			title: None,
+			group_id: group,
+			member,
+			font: canvas::FONT_SIZE,
+			cell,
+		};
+		let Some(tab) = self.tabs.get(tab_index) else {
+			return;
+		};
 		let mut drawn = Self::drawn_ids(tab);
 		let fits = Layout::tiled_fits(drawn.len() + 1, cols, rows);
 		if !fits {
 			let mut panes = HashMap::new();
 			panes.insert(id, pane);
-			self.tabs.push(Tab { layout: Layout::new(id, cols, rows), saved: None, panes, focus: id, hidden: Vec::new() });
+			self.tabs.push(Tab {
+				layout: Layout::new(id, cols, rows),
+				saved: None,
+				panes,
+				focus: id,
+				hidden: Vec::new(),
+			});
 			if focus_new {
 				self.active = self.tabs.len() - 1;
 			}
@@ -728,11 +860,13 @@ impl App {
 		}
 		if drawn.len() >= self.pane_limit {
 			let focus = self.tabs[tab_index].focus;
-			if let Some(victim) =
-				lowest_priority(&drawn, &self.prio, Some(focus)).or_else(|| lowest_priority(&drawn, &self.prio, None))
+			if let Some(victim) = lowest_priority(&drawn, &self.prio, Some(focus))
+				.or_else(|| lowest_priority(&drawn, &self.prio, None))
 			{
 				drawn.retain(|pane| *pane != victim);
-				let Some(tab) = self.tabs.get_mut(tab_index) else { return };
+				let Some(tab) = self.tabs.get_mut(tab_index) else {
+					return;
+				};
 				if !tab.hidden.contains(&victim) {
 					tab.hidden.push(victim);
 				}
@@ -743,7 +877,9 @@ impl App {
 		}
 		drawn.push(id);
 		self.retile_ids(tab_index, drawn);
-		let Some(tab) = self.tabs.get_mut(tab_index) else { return };
+		let Some(tab) = self.tabs.get_mut(tab_index) else {
+			return;
+		};
 		tab.panes.insert(id, pane);
 		if focus_new {
 			tab.focus = id;
@@ -770,9 +906,13 @@ impl App {
 			if bytes.len() % 2 != 0 {
 				return;
 			}
-			let units: Vec<u16> =
-				bytes.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect();
-			let Ok(mut text) = String::from_utf16(&units) else { return };
+			let units: Vec<u16> = bytes
+				.chunks_exact(2)
+				.map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+				.collect();
+			let Ok(mut text) = String::from_utf16(&units) else {
+				return;
+			};
 			while text.ends_with('\0') {
 				text.pop();
 			}
@@ -791,14 +931,26 @@ impl App {
 		let editor = match Editor::open(path.clone(), false) {
 			Ok(editor) => editor,
 			Err(err) => {
-				self.modal = Some(Modal::Notice(format!("无法读取 {}：{err}。文件没有被改动。", path.display())));
+				self.modal = Some(Modal::Notice(format!(
+					"无法读取 {}：{err}。文件没有被改动。",
+					path.display()
+				)));
 				return None;
 			}
 		};
 		let id = self.next_pane;
 		self.next_pane += 1;
 		let tab = self.active;
-		self.add_pane(tab, id, Body::Solid(editor), Owner::Normal, false, 0, None, true);
+		self.add_pane(
+			tab,
+			id,
+			Body::Solid(editor),
+			Owner::Normal,
+			false,
+			0,
+			None,
+			true,
+		);
 		Some(id)
 	}
 
@@ -807,7 +959,8 @@ impl App {
 		for tab in &self.tabs {
 			for pane in tab.panes.values() {
 				if let Body::Solid(editor) = &pane.body {
-					let open = std::fs::canonicalize(&editor.path).unwrap_or_else(|_| editor.path.clone());
+					let open =
+						std::fs::canonicalize(&editor.path).unwrap_or_else(|_| editor.path.clone());
 					if open == target {
 						return Some(pane.id);
 					}
@@ -833,7 +986,9 @@ impl App {
 	}
 
 	fn open_group(&mut self) -> PaneId {
-		let root = std::env::current_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+		let root = std::env::current_dir()
+			.map(|p| p.to_string_lossy().into_owned())
+			.unwrap_or_default();
 		let group_id = self.next_group;
 		self.next_group += 1;
 		let name = format!("even{group_id}");
@@ -841,7 +996,16 @@ impl App {
 		let id = self.next_pane;
 		self.next_pane += 1;
 		let tab = self.active;
-		self.add_pane(tab, id, Body::Even(Box::new(group)), Owner::Normal, false, group_id, None, true);
+		self.add_pane(
+			tab,
+			id,
+			Body::Even(Box::new(group)),
+			Owner::Normal,
+			false,
+			group_id,
+			None,
+			true,
+		);
 		id
 	}
 
@@ -892,7 +1056,9 @@ impl App {
 	}
 
 	fn zoomed(&self) -> bool {
-		self.tabs.get(self.active).is_some_and(|tab| tab.saved.is_some())
+		self.tabs
+			.get(self.active)
+			.is_some_and(|tab| tab.saved.is_some())
 	}
 
 	fn unzoom_active(&mut self) {
@@ -904,7 +1070,9 @@ impl App {
 	fn toggle_zoom(&mut self) {
 		let (cols, rows) = self.content_cells();
 		let active = self.active;
-		let Some(tab) = self.tabs.get_mut(active) else { return };
+		let Some(tab) = self.tabs.get_mut(active) else {
+			return;
+		};
 		match tab.saved.take() {
 			Some(mut saved) => {
 				saved.resize(cols, rows);
@@ -916,7 +1084,10 @@ impl App {
 					return;
 				}
 				let focus = tab.focus;
-				tab.saved = Some(std::mem::replace(&mut tab.layout, Layout::new(focus, cols, rows)));
+				tab.saved = Some(std::mem::replace(
+					&mut tab.layout,
+					Layout::new(focus, cols, rows),
+				));
 			}
 		}
 		self.resize_panes();
@@ -925,7 +1096,9 @@ impl App {
 	/// The tiled layout: while zoomed, that is the saved one, since the live
 	/// layout holds only the zoomed pane.
 	fn tiled(&self) -> Option<&Layout> {
-		self.tabs.get(self.active).map(|tab| tab.saved.as_ref().unwrap_or(&tab.layout))
+		self.tabs
+			.get(self.active)
+			.map(|tab| tab.saved.as_ref().unwrap_or(&tab.layout))
 	}
 
 	fn note_human(&mut self, id: PaneId) {
@@ -946,7 +1119,9 @@ impl App {
 		let (cols, rows) = self.content_cells();
 		drawn.sort_unstable();
 		drawn.dedup();
-		let Some(tab) = self.tabs.get_mut(tab_index) else { return };
+		let Some(tab) = self.tabs.get_mut(tab_index) else {
+			return;
+		};
 		tab.saved = None;
 		tab.layout = Layout::tiled(&drawn, cols, rows);
 	}
@@ -960,7 +1135,9 @@ impl App {
 	/// running, so the tab can draw one more. Its switch time is kept: when it
 	/// comes back it comes back at that place in the order.
 	fn hide_window(&mut self, tab_index: usize, id: PaneId) {
-		let Some(tab) = self.tabs.get(tab_index) else { return };
+		let Some(tab) = self.tabs.get(tab_index) else {
+			return;
+		};
 		let mut drawn = Self::drawn_ids(tab);
 		if !drawn.contains(&id) {
 			return;
@@ -973,22 +1150,74 @@ impl App {
 			}
 		}
 		self.retile_ids(tab_index, drawn.clone());
-		let Some(tab) = self.tabs.get_mut(tab_index) else { return };
+		let Some(tab) = self.tabs.get_mut(tab_index) else {
+			return;
+		};
 		if focus == id {
 			tab.focus = drawn.first().copied().unwrap_or(id);
 		}
 	}
 
-	fn make_room(&mut self, tab_index: usize) {
-		let Some(tab) = self.tabs.get(tab_index) else { return };
-		let drawn = Self::drawn_ids(tab);
-		if drawn.len() < self.pane_limit {
+	/// `o`: one more odd terminal window in the current tab, laid out tiled.
+	fn open_terminal(&mut self) {
+		self.unzoom_active();
+		let command = self.shell.clone();
+		let envs = self.child_env.clone();
+		let Some((id, term)) = self.spawn_term(&command, &envs) else {
 			return;
-		}
-		let victim = lowest_priority(&drawn, &self.prio, Some(tab.focus))
-			.or_else(|| lowest_priority(&drawn, &self.prio, None));
-		if let Some(victim) = victim {
-			self.hide_window(tab_index, victim);
+		};
+		let tab = self.active;
+		self.add_pane(
+			tab,
+			id,
+			Body::Term(term),
+			Owner::Normal,
+			false,
+			0,
+			None,
+			true,
+		);
+	}
+
+	/// `Ctrl+=` / `Ctrl+-`: the focused window's own font only. The tiling
+	/// keeps the base grid; the window just draws fewer or more cells.
+	fn zoom_font(&mut self, delta: i32) {
+		let Some(id) = self.focused_id() else { return };
+		self.zoom_font_at(id, delta);
+	}
+
+	/// `Ctrl+wheel` zooms the window under the pointer, the one the wheel is
+	/// aimed at; it does not steal focus from the keyboard's window.
+	fn zoom_font_at(&mut self, id: PaneId, delta: i32) {
+		let Some(pane) = self.pane_mut(id) else {
+			return;
+		};
+		pane.font = (pane.font + delta).clamp(canvas::MIN_FONT_SIZE, canvas::MAX_FONT_SIZE);
+		self.resize_panes();
+	}
+
+	/// `s`: the Windows file picker, as Explorer shows it.
+	fn pick_file(&mut self) -> Option<PathBuf> {
+		unsafe {
+			let filter: Vec<u16> = "所有文件\0*.*\0\0".encode_utf16().collect();
+			let title: Vec<u16> = "打开文件"
+				.encode_utf16()
+				.chain(std::iter::once(0))
+				.collect();
+			let mut buf = [0u16; 32768];
+			let mut ofn: OPENFILENAMEW = zeroed();
+			ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
+			ofn.hwndOwner = self.hwnd;
+			ofn.lpstrFilter = filter.as_ptr();
+			ofn.lpstrFile = buf.as_mut_ptr();
+			ofn.nMaxFile = buf.len() as u32;
+			ofn.lpstrTitle = title.as_ptr();
+			ofn.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+			if GetOpenFileNameW(&mut ofn) == 0 {
+				return None;
+			}
+			let len = buf.iter().position(|unit| *unit == 0).unwrap_or(0);
+			Some(PathBuf::from(String::from_utf16_lossy(&buf[..len])))
 		}
 	}
 
@@ -996,7 +1225,9 @@ impl App {
 	/// small for one more tiled cell.
 	fn show_window(&mut self, tab_index: usize, id: PaneId) -> bool {
 		let (cols, rows) = self.content_cells();
-		let Some(tab) = self.tabs.get(tab_index) else { return false };
+		let Some(tab) = self.tabs.get(tab_index) else {
+			return false;
+		};
 		if !tab.panes.contains_key(&id) {
 			return false;
 		}
@@ -1010,7 +1241,9 @@ impl App {
 		let was_empty = drawn.is_empty();
 		drawn.push(id);
 		self.retile_ids(tab_index, drawn);
-		let Some(tab) = self.tabs.get_mut(tab_index) else { return false };
+		let Some(tab) = self.tabs.get_mut(tab_index) else {
+			return false;
+		};
 		tab.hidden.retain(|pane| *pane != id);
 		if was_empty {
 			tab.focus = id;
@@ -1023,7 +1256,9 @@ impl App {
 	fn fill_limit(&mut self, tab_index: usize) {
 		loop {
 			let next = {
-				let Some(tab) = self.tabs.get(tab_index) else { return };
+				let Some(tab) = self.tabs.get(tab_index) else {
+					return;
+				};
 				if Self::drawn_ids(tab).len() >= self.pane_limit || tab.hidden.is_empty() {
 					return;
 				}
@@ -1039,7 +1274,9 @@ impl App {
 	fn enforce_limit(&mut self, tab_index: usize) {
 		loop {
 			let victim = {
-				let Some(tab) = self.tabs.get(tab_index) else { return };
+				let Some(tab) = self.tabs.get(tab_index) else {
+					return;
+				};
 				let drawn = Self::drawn_ids(tab);
 				if drawn.len() <= self.pane_limit {
 					return;
@@ -1068,25 +1305,14 @@ impl App {
 	}
 
 	fn focus_dir(&mut self, dx: i32, dy: i32) {
-		let Some(focus) = self.tabs.get(self.active).map(|tab| tab.focus) else { return };
-		let next = self.tiled().and_then(|layout| layout.neighbour(focus, dx, dy));
+		let Some(focus) = self.tabs.get(self.active).map(|tab| tab.focus) else {
+			return;
+		};
+		let next = self
+			.tiled()
+			.and_then(|layout| layout.neighbour(focus, dx, dy));
 		let Some(next) = next else { return };
 		// window_set_active_pane unzooms when the target is not the zoomed pane.
-		self.unzoom_active();
-		self.focus_pane(next);
-		self.note_human(next);
-	}
-
-	fn cycle_pane(&mut self) {
-		let next = self.tabs.get(self.active).and_then(|tab| {
-			let leaves = tab.saved.as_ref().unwrap_or(&tab.layout).leaves();
-			if leaves.len() < 2 {
-				return None;
-			}
-			let pos = leaves.iter().position(|p| *p == tab.focus).unwrap_or(0);
-			Some(leaves[(pos + 1) % leaves.len()])
-		});
-		let Some(next) = next else { return };
 		self.unzoom_active();
 		self.focus_pane(next);
 		self.note_human(next);
@@ -1100,18 +1326,20 @@ impl App {
 			Dir::Right => LayoutType::LeftRight,
 			Dir::Down => LayoutType::TopBottom,
 		};
-		let Some(tab) = self.tabs.get_mut(self.active) else { return };
+		let Some(tab) = self.tabs.get_mut(self.active) else {
+			return;
+		};
 		tab.layout.resize_pane(tab.focus, lc_type, cells, true);
 		self.resize_panes();
 	}
 
 	fn forward_focus(&mut self, focused: bool) {
+		// Focus events belong to the terminal program, not to whoever holds the
+		// window: an AI-held pane must see them exactly like a normal one.
 		if let Some(pane) = self.focused_mut() {
-			if pane.owner == Owner::Normal {
-				if let Body::Term(term) = &mut pane.body {
-					if term.screen.modes.focus_events {
-						term.write(if focused { b"\x1b[I" } else { b"\x1b[O" });
-					}
+			if let Body::Term(term) = &mut pane.body {
+				if term.screen.modes.focus_events {
+					term.write(if focused { b"\x1b[I" } else { b"\x1b[O" });
 				}
 			}
 		}
@@ -1145,49 +1373,45 @@ impl App {
 				}
 			}
 		}
-		if !key.down {
-			if self.mode != Mode::Normal {
-				self.forward_key(key);
-			}
-			return true;
-		}
 		if key.vk == VK_F1 {
-			// F1 lands on the control mode and only that: normal in a window no
-			// AI holds, agent in an AI window. Typing modes are entered with i,
-			// Enter or a click.
-			if let Some(pane) = self.focused_mut() {
-				if let Owner::Share(agent) = pane.owner.clone() {
-					pane.owner = Owner::Agent(agent);
-				}
+			// F1 belongs to delta in every keyboard mode. It lands on the control
+			// mode and only that: normal in a window no AI holds, agent in an AI
+			// window. Typing modes are entered with i.
+			if key.down {
+				self.mode = Mode::Normal;
+				self.sync_owner_to_mode();
 			}
-			self.mode = Mode::Normal;
 			return true;
 		}
+		// F2-F12 also stay with delta in a typing mode. Everything else is the
+		// program's in insert/share, and everything at all is delta's in
+		// normal/agent.
+		let function_key = matches!(key.vk, 0x70..=0x7B);
 		if self.mode == Mode::Normal {
-			return self.normal_key(key);
+			if key.down {
+				self.normal_key(key);
+			}
+			return true;
 		}
-		self.insert_key(key)
+		if function_key {
+			return true;
+		}
+		self.insert_key(key);
+		true
 	}
 
 	fn normal_key(&mut self, key: &Key) -> bool {
 		if key.ctrl && !key.alt {
 			match key.vk {
 				0x43 => {
+					// The selection is delta's in this mode, so copying it is
+					// delta's too. What Ctrl+C means to a program is settled in
+					// the program, in insert.
 					self.copy_selection();
 					return true;
 				}
 				0x56 => {
 					self.paste();
-					return true;
-				}
-				0x53 => {
-					if let Some(pane) = self.focused_mut() {
-						if let Body::Solid(editor) = &mut pane.body {
-							if let Err(err) = editor.save() {
-								editor.status = format!("保存失败：{err}");
-							}
-						}
-					}
 					return true;
 				}
 				0x25 => {
@@ -1206,30 +1430,20 @@ impl App {
 					self.adjust_size(Dir::Down, 1);
 					return true;
 				}
-				_ => {}
+				0xBB | 0x6B => {
+					self.zoom_font(2);
+					return true;
+				}
+				0xBD | 0x6D => {
+					self.zoom_font(-2);
+					return true;
+				}
+				// Any other Ctrl chord is delta's too in normal; it just has no
+				// action yet. Nothing is forwarded to the program.
+				_ => return true,
 			}
 		}
 		match key.vk {
-			VK_ESCAPE => {
-				self.forward_key(key);
-				return true;
-			}
-			0x0D => {
-				// In an AI window the typing mode is share, just as insert is the
-				// typing mode elsewhere.
-				match self.focused().map(|p| p.owner.clone()) {
-					Some(Owner::Agent(agent)) => {
-						if let Some(pane) = self.focused_mut() {
-							pane.owner = Owner::Share(agent);
-						}
-					}
-					Some(Owner::Share(_)) => return true,
-					_ => {}
-				}
-				self.mode = Mode::Insert;
-				self.ime_position(self.hwnd);
-				return true;
-			}
 			0x25 => {
 				self.focus_dir(-1, 0);
 				return true;
@@ -1253,8 +1467,6 @@ impl App {
 		};
 		match ch {
 			'c' => self.new_terminal_tab(),
-			'%' => self.split_pane(Dir::Right),
-			'"' => self.split_pane(Dir::Down),
 			'x' => {
 				if let Some(id) = self.focused_id() {
 					self.request_close_pane(id);
@@ -1262,9 +1474,8 @@ impl App {
 			}
 			'&' => self.request_close_tab(),
 			'z' => self.toggle_zoom(),
-			'o' => self.cycle_pane(),
 			'n' => self.next_tab(1),
-			'p' => self.modal = Some(Modal::PaneLimit),
+			'p' => self.modal = Some(Modal::PaneLimit { scroll: 0 }),
 			'w' => self.modal = Some(Modal::Tabs),
 			'[' => {
 				self.scroll_mode = true;
@@ -1274,21 +1485,19 @@ impl App {
 			'q' => self.show_numbers = !self.show_numbers,
 			'?' => self.modal = Some(Modal::Help),
 			'e' => {
-				let path = std::env::current_dir().unwrap_or_default().join("untitled.txt");
-				self.open_editor(path);
-			}
-			'g' => {
 				self.open_group();
+			}
+			'o' => self.open_terminal(),
+			's' => {
+				if let Some(path) = self.pick_file() {
+					self.open_editor(path);
+				}
 			}
 			'i' => {
 				// Agent is the AI window's normal, so i enters its typing mode,
 				// share, the same way it enters insert elsewhere.
-				if let Some(Owner::Agent(agent)) = self.focused().map(|p| p.owner.clone()) {
-					if let Some(pane) = self.focused_mut() {
-						pane.owner = Owner::Share(agent);
-					}
-				}
 				self.mode = Mode::Insert;
+				self.sync_owner_to_mode();
 				self.ime_position(self.hwnd);
 			}
 			'1'..='9' => {
@@ -1303,207 +1512,74 @@ impl App {
 		true
 	}
 
+	/// In insert/share, delta keeps only F1-F12. Every other key goes to the
+	/// program in the window untouched, including Ctrl chords, mouse selection
+	/// and the wheel. Whether a key means copy, interrupt or anything else is
+	/// decided by that program, not here.
 	fn insert_key(&mut self, key: &Key) -> bool {
-		let Some(pane) = self.focused() else { return true };
-		if let Owner::Agent(_) = pane.owner {
+		let Some(pane) = self.focused_mut() else {
 			return true;
-		}
-		let kind = match &pane.body {
-			Body::Term(_) => 0,
-			Body::Solid(_) => 1,
-			Body::Even(_) => 2,
 		};
-		if key.ctrl && !key.alt {
-			match key.vk {
-				0x56 => {
-					if !self.paste() && kind == 0 {
-						self.forward_key(key);
-					}
-					return true;
-				}
-				// As in any terminal: with text selected Ctrl+C copies it, without a selection
-				// it is the interrupt character for the program in the pane.
-				0x43 if kind == 0 => {
-					let selected = self.focused().is_some_and(|pane| {
-						matches!(&pane.body, Body::Term(term) if term.selection.is_some())
-					});
-					if selected {
-						self.copy_selection();
-						return true;
-					}
-				}
-				_ => {}
-			}
-			if kind == 1 {
-				let mut handled = true;
-				match key.vk {
-					0x41 => {
-						if let Some(pane) = self.focused_mut() {
-							if let Body::Solid(editor) = &mut pane.body {
-								editor.select_all();
-							}
-						}
-					}
-					0x43 => self.copy_selection(),
-					0x58 => {
-						if let Some(pane) = self.focused_mut() {
-							if let Body::Solid(editor) = &mut pane.body {
-								let text = editor.cut();
-								if !text.is_empty() {
-									set_clipboard(&text);
-								}
-							}
-						}
-					}
-					0x5A => {
-						if let Some(pane) = self.focused_mut() {
-							if let Body::Solid(editor) = &mut pane.body {
-								if key.shift {
-									editor.redo();
-								} else {
-									editor.undo();
-								}
-							}
-						}
-					}
-					0x59 => {
-						if let Some(pane) = self.focused_mut() {
-							if let Body::Solid(editor) = &mut pane.body {
-								editor.redo();
-							}
-						}
-					}
-					0x53 => {
-						if let Some(pane) = self.focused_mut() {
-							if let Body::Solid(editor) = &mut pane.body {
-								if let Err(err) = editor.save() {
-									editor.status = format!("保存失败：{err}");
-								}
-							}
-						}
-					}
-					_ => handled = false,
-				}
-				if handled {
-					return true;
-				}
-			} else if kind == 2 {
-				if key.vk == 0x16 {
-					self.paste();
-					return true;
-				}
-			}
-		}
-		match kind {
-			0 => {
-				self.forward_key(key);
-				true
-			}
-			1 => self.editor_key(key),
-			_ => self.even_key(key),
-		}
-	}
-
-	fn editor_key(&mut self, key: &Key) -> bool {
-		let shift = key.shift;
-		let ctrl = key.ctrl && !key.alt;
-		let replace = self.mode == Mode::Replace;
-		let Some(pane) = self.focused_mut() else { return true };
-		let Body::Solid(editor) = &mut pane.body else { return true };
-		match key.vk {
-			0x0D => editor.split_line(),
-			0x08 => editor.backspace(),
-			0x2E => editor.delete(),
-			0x09 => editor.insert('\t', false),
-			0x1B => {}
-			0x25 => {
-				if ctrl {
-					editor.word_left(shift);
-				} else {
-					editor.move_cursor(0, -1, shift);
-				}
-			}
-			0x27 => {
-				if ctrl {
-					editor.word_right(shift);
-				} else {
-					editor.move_cursor(0, 1, shift);
-				}
-			}
-			0x26 => editor.move_cursor(-1, 0, shift),
-			0x28 => editor.move_cursor(1, 0, shift),
-			0x24 => editor.home(shift),
-			0x23 => editor.end(shift),
-			0x21 => editor.move_cursor(-10, 0, shift),
-			0x22 => editor.move_cursor(10, 0, shift),
-			0x2D => {
-				self.mode = if self.mode == Mode::Replace { Mode::Insert } else { Mode::Replace };
-				return true;
-			}
-			_ => {
-				if let Some(ch) = key.ch {
-					// AltGr arrives as Ctrl+Alt; it is still text input.
-					let text = !ch.is_control() && (!key.ctrl && !key.alt || key.right_alt);
-					if text {
-						editor.insert(ch, replace);
-					}
-				}
-			}
-		}
-		true
-	}
-
-	fn even_key(&mut self, key: &Key) -> bool {
-		let Some(pane) = self.focused_mut() else { return true };
-		let Body::Even(group) = &mut pane.body else { return true };
-		match key.vk {
-			0x0D => group.enter(),
-			0x08 => group.backspace(),
-			0x2E => group.delete(),
-			0x09 => group.insert_char('\t'),
-			0x1B => {}
-			0x25 => group.move_input(-1),
-			0x27 => group.move_input(1),
-			0x26 => group.scroll(1),
-			0x28 => group.scroll(-1),
-			0x24 => group.input_home(),
-			0x23 => group.input_end(),
-			0x21 => group.scroll(10),
-			0x22 => group.scroll(-10),
-			_ => {
-				if let Some(ch) = key.ch {
-					if !ch.is_control() && (!key.ctrl && !key.alt || key.right_alt) {
-						group.insert_char(ch);
-					}
-				}
-			}
-		}
-		true
-	}
-
-	fn forward_key(&mut self, key: &Key) {
-		let Some(pane) = self.focused_mut() else { return };
 		match &mut pane.body {
 			Body::Term(term) => {
-				if term.exited {
-					return;
-				}
-				// Modifier presses alone are not typing; they must not drop a selection.
-				if key.down && !is_modifier(key.vk) {
-					term.selection = None;
-				}
-				let modes = term.screen.modes;
-				let bytes = input::encode(key, modes.win32_input, modes.kitty_flags, modes.cursor_keys, modes.newline_mode);
-				term.write(&bytes);
+				term.key(key);
+				// ConPTY's host never raises the console's Ctrl+C event, so the byte alone
+				// disappears. Tell the shell that is listening on the control pipe, as the
+				// console host would.
 				if key.down && key.ctrl && !key.alt && !key.shift && key.vk == 0x43 {
 					if let Some(pty) = &term.pty {
 						pty.interrupt();
 					}
 				}
 			}
-			Body::Solid(_) => {}
-			Body::Even(_) => {}
+			Body::Solid(editor) => {
+				editor.key(key);
+			}
+			Body::Even(group) => {
+				group.key(key);
+			}
 		}
+		true
+	}
+
+	fn copy_selection(&mut self) {
+		let Some(pane) = self.focused() else { return };
+		let text = match &pane.body {
+			Body::Term(term) => term.selection_text(),
+			Body::Solid(editor) => {
+				if editor.has_selection() {
+					Some(editor.selected_text())
+				} else {
+					None
+				}
+			}
+			Body::Even(group) => {
+				let text = group.selected_text();
+				(!text.is_empty()).then_some(text)
+			}
+		};
+		if let Some(text) = text.filter(|text| !text.is_empty()) {
+			clipboard::set(&text);
+		}
+	}
+
+	fn paste(&mut self) -> bool {
+		let Some(pane) = self.focused_mut() else {
+			return false;
+		};
+		match &mut pane.body {
+			Body::Term(term) => {
+				// 终端只收文本字节；图片对 cmd 这类程序没有字节语义。
+				let Some(clipboard::Paste::Text(text)) = clipboard::paste() else {
+					return false;
+				};
+				term.paste(&text);
+			}
+			// solid 只编辑文本；图片在 even 里变成 Markdown 图片路径。
+			Body::Solid(editor) => editor.paste_clipboard(),
+			Body::Even(group) => group.paste(),
+		}
+		true
 	}
 
 	fn scroll_key(&mut self, key: &Key) {
@@ -1522,46 +1598,8 @@ impl App {
 			0x22 => scroll_body(&mut pane.body, -10),
 			0x24 => scroll_body(&mut pane.body, 100000),
 			0x23 => scroll_body(&mut pane.body, -100000),
-			0x43 => {
-				if key.ctrl {
-					self.copy_selection();
-				}
-			}
 			_ => {}
 		}
-	}
-
-	fn split_pane(&mut self, dir: Dir) {
-		// cmd-split-window unzooms the window before tiling the new pane.
-		self.unzoom_active();
-		let active = self.active;
-		let Some(tab) = self.tabs.get(active) else { return };
-		// A limit of one replaces the drawn window instead of finding space
-		// next to it.
-		let replaces = tab.layout.leaves().len() == 1 && self.pane_limit == 1;
-		if !replaces && !tab.layout.can_split(tab.focus, dir) {
-			self.modal = Some(Modal::Notice(String::from("窗口太小，再分没有空间了。")));
-			return;
-		}
-		let command = self.shell.clone();
-		let envs = self.child_env.clone();
-		let Some((id, term)) = self.spawn_term(&command, &envs) else { return };
-		let (cols, rows) = self.content_cells();
-		self.make_room(active);
-		let Some(tab) = self.tabs.get_mut(active) else { return };
-		if tab.layout.leaves().is_empty() {
-			tab.layout = Layout::new(id, cols, rows);
-		} else {
-			let focus = tab.focus;
-			if !tab.layout.split(focus, id, dir) {
-				return;
-			}
-		}
-		tab.panes.insert(id, Pane { id, body: Body::Term(term), owner: Owner::Normal, seen: false, ai_created: false, creator: None, title: None, group_id: 0, member: None });
-		tab.focus = id;
-		self.note_human(id);
-		self.resize_panes();
-		self.mode = Mode::Insert;
 	}
 
 	fn break_pane(&mut self) {
@@ -1569,7 +1607,9 @@ impl App {
 		self.unzoom_active();
 		let (cols, rows) = self.content_cells();
 		let active = self.active;
-		let Some(tab) = self.tabs.get_mut(active) else { return };
+		let Some(tab) = self.tabs.get_mut(active) else {
+			return;
+		};
 		if tab.panes.len() < 2 {
 			return;
 		}
@@ -1577,12 +1617,20 @@ impl App {
 		let mut drawn = Self::drawn_ids(tab);
 		drawn.retain(|pane| *pane != id);
 		tab.hidden.retain(|pane| *pane != id);
-		let Some(pane) = tab.panes.remove(&id) else { return };
+		let Some(pane) = tab.panes.remove(&id) else {
+			return;
+		};
 		tab.focus = drawn.first().copied().unwrap_or(0);
 		self.retile_ids(active, drawn);
 		let mut panes = HashMap::new();
 		panes.insert(id, pane);
-		self.tabs.push(Tab { layout: Layout::new(id, cols, rows), saved: None, panes, focus: id, hidden: Vec::new() });
+		self.tabs.push(Tab {
+			layout: Layout::new(id, cols, rows),
+			saved: None,
+			panes,
+			focus: id,
+			hidden: Vec::new(),
+		});
 		self.active = self.tabs.len() - 1;
 		self.fill_limit(active);
 		self.resize_panes();
@@ -1601,49 +1649,13 @@ impl App {
 		self.mark_seen();
 	}
 
-	fn copy_selection(&mut self) {
-		let Some(pane) = self.focused() else { return };
-		let text = match &pane.body {
-			Body::Term(term) => term.selection_text(),
-			Body::Solid(editor) => {
-				if editor.has_selection() {
-					Some(editor.selected_text())
-				} else {
-					None
-				}
-			}
-			Body::Even(_) => None,
-		};
-		if let Some(text) = text {
-			set_clipboard(&text);
-		}
-	}
-
-	fn paste(&mut self) -> bool {
-		let Some(pane) = self.focused() else { return false };
-		if let Owner::Agent(_) = pane.owner {
-			return false;
-		}
-		let text = clipboard_text().filter(|text| !text.is_empty())
-			.or_else(|| clipboard_image_path().map(|path| format!("{path} ")));
-		let Some(text) = text else { return false };
-		let Some(pane) = self.focused_mut() else { return false };
-		match &mut pane.body {
-			Body::Term(term) => term.paste(&text),
-			Body::Solid(editor) => editor.paste(&text),
-			Body::Even(group) => group.insert_text(&text),
-		}
-		true
-	}
-
 	fn insert_text(&mut self, text: &str) {
 		if text.is_empty() {
 			return;
 		}
-		let Some(pane) = self.focused_mut() else { return };
-		if let Owner::Agent(_) = pane.owner {
+		let Some(pane) = self.focused_mut() else {
 			return;
-		}
+		};
 		match &mut pane.body {
 			Body::Term(term) => term.write(text.as_bytes()),
 			Body::Solid(editor) => editor.paste(text),
@@ -1658,7 +1670,8 @@ impl App {
 				return String::new();
 			}
 			let mut buf = vec![0u16; (len as usize + 1) / 2];
-			let copied = ImmGetCompositionStringW(himc, flag, buf.as_mut_ptr() as *mut _, len as u32);
+			let copied =
+				ImmGetCompositionStringW(himc, flag, buf.as_mut_ptr() as *mut _, len as u32);
 			if copied <= 0 {
 				return String::new();
 			}
@@ -1691,13 +1704,19 @@ impl App {
 		if self.mode == Mode::Normal {
 			return;
 		}
-		let Some((x, y)) = self.caret_pixel() else { return };
+		let Some((x, y)) = self.caret_pixel() else {
+			return;
+		};
 		self.ime_caret = Some((x, y));
 		unsafe {
 			let himc = ImmGetContext(hwnd);
 			if himc.is_null() {
 				return;
 			}
+			let (cw, ch) = self
+				.focused()
+				.map(|pane| pane.cell)
+				.unwrap_or((self.canvas.cell_w, self.canvas.cell_h));
 			let form = COMPOSITIONFORM {
 				dwStyle: CFS_POINT,
 				ptCurrentPos: POINT { x, y },
@@ -1711,8 +1730,8 @@ impl App {
 				rcArea: RECT {
 					left: x,
 					top: y,
-					right: x + self.canvas.cell_w,
-					bottom: y + self.canvas.cell_h,
+					right: x + cw,
+					bottom: y + ch,
 				},
 			};
 			let _ = ImmSetCandidateWindow(himc, &candidate);
@@ -1724,8 +1743,7 @@ impl App {
 		let id = self.focused_id()?;
 		let pane = self.pane(id)?;
 		let rect = self.pane_rect(id)?;
-		let cw = self.canvas.cell_w;
-		let ch = self.canvas.cell_h;
+		let (cw, ch) = (pane.cell.0.max(1), pane.cell.1.max(1));
 		match &pane.body {
 			Body::Term(term) => {
 				let (col, row) = term.screen.cursor();
@@ -1737,7 +1755,11 @@ impl App {
 				let row = editor.cursor.0.saturating_sub(editor.scroll);
 				let mut visual = 0usize;
 				for c in editor.lines[editor.cursor.0].iter().take(editor.cursor.1) {
-					visual += if *c == '\t' { 4 - visual % 4 } else { crate::solid::char_cells(*c) };
+					visual += if *c == '\t' {
+						4 - visual % 4
+					} else {
+						crate::solid::char_cells(*c)
+					};
 				}
 				let col = visual.saturating_sub(editor.hscroll);
 				Some((rect.left + col as i32 * cw, rect.top + row as i32 * ch))
@@ -1757,121 +1779,214 @@ impl App {
 		}
 		let tab = self.tabs.get(self.active)?;
 		let area = self.content_area();
-		self.rects_of(tab, area).into_iter().find(|(_, r)| r.contains(x, y)).map(|(id, _)| id)
+		self.rects_of(tab, area)
+			.into_iter()
+			.find(|(_, r)| r.contains(x, y))
+			.map(|(id, _)| id)
 	}
 
 	fn cell_of(&self, id: PaneId, x: i32, y: i32) -> Option<(usize, usize, bool)> {
 		let rect = self.pane_rect(id)?;
 		let pane = self.pane(id)?;
-		let Body::Term(term) = &pane.body else { return None };
-		let cw = self.canvas.cell_w;
-		let ch = self.canvas.cell_h;
+		let Body::Term(term) = &pane.body else {
+			return None;
+		};
+		let cw = pane.cell.0.max(1);
+		let ch = pane.cell.1.max(1);
 		let col = ((x - rect.left) / cw).max(0) as usize;
 		let row = ((y - rect.top) / ch).max(0) as usize;
 		Some((term.view_top() + row, col, term.alt))
 	}
 
 	fn mouse_down(&mut self, x: i32, y: i32) {
-		let Some(id) = self.mouse_target(x, y) else { return };
+		let Some(id) = self.mouse_target(x, y) else {
+			return;
+		};
 		let already_focused = self.focused_id() == Some(id);
 		self.focus_pane(id);
 		if !already_focused {
 			self.note_human(id);
 		}
-		// Five window modes. Clicking into an AI window from outside always lands
-		// in agent, the way a plain window lands in normal; clicking inside the
-		// share window keeps the human typing.
+		// A click is the same click in every window: it lands on the control
+		// mode. Which control mode that is — normal or agent — is the owner's
+		// business, not the mouse's.
 		if !self.scroll_mode {
-			match self.pane(id).map(|p| p.owner.clone()) {
-				Some(Owner::Share(_)) if already_focused => self.mode = Mode::Insert,
-				Some(Owner::Share(agent)) => {
-					if let Some(pane) = self.pane_mut(id) {
-						pane.owner = Owner::Agent(agent);
-					}
-					self.mode = Mode::Normal;
-				}
-				_ => self.mode = Mode::Normal,
-			}
+			self.mode = Mode::Normal;
+			self.sync_owner_to_mode();
 		}
 		if let Some(pane) = self.pane_mut(id) {
 			pane.ai_created = false;
 		}
 		let shift = unsafe { GetKeyState(VK_SHIFT as i32) < 0 };
-		self.drag = Some(Drag { pane: id, moved: false });
+		self.drag = Some(Drag {
+			pane: id,
+			moved: false,
+		});
 		unsafe {
 			SetCapture(self.hwnd);
 		}
-		if let Some((row, col, alt)) = self.cell_of(id, x, y) {
-			let reporting = self
-				.pane(id)
-				.map(|p| match &p.body {
-					Body::Term(term) => term.screen.modes.mouse_mode != MouseMode::None,
-					_ => false,
-				})
-				.unwrap_or(false);
-			if reporting && !shift {
-				self.send_mouse(id, x, y, 0, false, false);
-				return;
-			}
-			if let Some(pane) = self.pane_mut(id) {
-				if let Body::Term(term) = &mut pane.body {
-					term.selection = Some(crate::term::Selection {
-						anchor: crate::term::Point { row, col },
-						cursor: crate::term::Point { row, col },
-						alt,
-					});
+		self.ime_position(self.hwnd);
+		let Some((row, col)) = self.screen_cell(id, x, y) else {
+			return;
+		};
+		let insert = self.mode == Mode::Insert;
+		enum Hit {
+			Program,
+			Term,
+			Solid,
+			Even,
+		}
+		let hit = match self.pane(id).map(|p| &p.body) {
+			Some(Body::Term(term)) => {
+				if insert {
+					if term.screen.modes.mouse_mode == MouseMode::None {
+						return;
+					}
+					Hit::Program
+				} else {
+					Hit::Term
 				}
 			}
-		} else {
-			self.editor_click(id, x, y, shift);
-		}
-		self.ime_position(self.hwnd);
-	}
-
-	fn mouse_move(&mut self, x: i32, y: i32) {
-		let Some(id) = self.drag.as_ref().map(|d| d.pane) else { return };
-		if let Some(drag) = &mut self.drag {
-			drag.moved = true;
-		}
-		if let Some((row, col, alt)) = self.cell_of(id, x, y) {
-			let mode = self.pane(id).and_then(|p| match &p.body {
-				Body::Term(term) => Some(term.screen.modes.mouse_mode),
-				_ => None,
-			});
-			// Shift is the way out of a program's mouse capture: the drag then
-			// extends a local selection instead of feeding motion to the program.
-			let shift = unsafe { GetKeyState(VK_SHIFT as i32) < 0 };
-			if matches!(mode, Some(MouseMode::Button) | Some(MouseMode::Any)) && !shift {
-				self.send_mouse(id, x, y, 0, false, true);
-				return;
+			Some(Body::Solid(_)) => Hit::Solid,
+			Some(Body::Even(_)) => Hit::Even,
+			None => return,
+		};
+		match hit {
+			Hit::Program => {
+				// Insert is the program's: a click is a click only if it asked
+				// for mouse reports, and it never falls back to delta's selection.
+				self.send_mouse(id, x, y, 0, false, false);
 			}
-			if let Some(pane) = self.pane_mut(id) {
-				if let Body::Term(term) = &mut pane.body {
-					if let Some(sel) = &mut term.selection {
-						sel.cursor = crate::term::Point { row, col };
-						sel.alt = alt;
+			Hit::Term => {
+				if let Some((abs, abs_col, alt)) = self.cell_of(id, x, y) {
+					if let Some(pane) = self.pane_mut(id) {
+						if let Body::Term(term) = &mut pane.body {
+							term.selection = Some(crate::term::Selection {
+								anchor: crate::term::Point {
+									row: abs,
+									col: abs_col,
+								},
+								cursor: crate::term::Point {
+									row: abs,
+									col: abs_col,
+								},
+								alt,
+							});
+						}
 					}
 				}
 			}
-		} else {
-			self.editor_click(id, x, y, true);
+			Hit::Solid => {
+				if let Some(pane) = self.pane_mut(id) {
+					if let Body::Solid(editor) = &mut pane.body {
+						editor.click_screen(row, col, shift);
+					}
+				}
+			}
+			Hit::Even => {
+				let ctrl = unsafe { GetKeyState(VK_CONTROL as i32) < 0 };
+				if let Some((cols, rows)) = self.body_cells(id) {
+					if let Some(pane) = self.pane_mut(id) {
+						if let Body::Even(group) = &mut pane.body {
+							// Ctrl+click is even's alone: it hands an image path or
+							// link to the system program instead of selecting.
+							if ctrl {
+								group.open_at(cols, rows, row, col);
+							} else {
+								group.press(cols, rows, row, col);
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	fn mouse_move(&mut self, x: i32, y: i32) {
+		let Some(id) = self.drag.as_ref().map(|d| d.pane) else {
+			return;
+		};
+		if let Some(drag) = &mut self.drag {
+			drag.moved = true;
+		}
+		let insert = self.mode == Mode::Insert;
+		enum Hit {
+			Program,
+			Term,
+			Solid,
+			Even,
+		}
+		let hit = match self.pane(id).map(|p| &p.body) {
+			Some(Body::Term(term)) => {
+				if insert {
+					if term.screen.modes.mouse_mode == MouseMode::None {
+						return;
+					}
+					Hit::Program
+				} else {
+					Hit::Term
+				}
+			}
+			Some(Body::Solid(_)) => Hit::Solid,
+			Some(Body::Even(_)) => Hit::Even,
+			None => return,
+		};
+		match hit {
+			Hit::Program => {
+				self.send_mouse(id, x, y, 0, false, true);
+			}
+			Hit::Term => {
+				if let Some((abs, col, alt)) = self.cell_of(id, x, y) {
+					if let Some(pane) = self.pane_mut(id) {
+						if let Body::Term(term) = &mut pane.body {
+							if let Some(sel) = &mut term.selection {
+								sel.cursor = crate::term::Point { row: abs, col };
+								sel.alt = alt;
+							}
+						}
+					}
+				}
+			}
+			Hit::Solid => {
+				if let Some((row, col)) = self.screen_cell(id, x, y) {
+					if let Some(pane) = self.pane_mut(id) {
+						if let Body::Solid(editor) = &mut pane.body {
+							editor.click_screen(row, col, true);
+						}
+					}
+				}
+			}
+			Hit::Even => {
+				if let Some((row, col)) = self.screen_cell(id, x, y) {
+					if let Some((cols, rows)) = self.body_cells(id) {
+						if let Some(pane) = self.pane_mut(id) {
+							if let Body::Even(group) = &mut pane.body {
+								group.drag(cols, rows, row, col);
+							}
+						}
+					}
+				}
+			}
 		}
 	}
 
 	fn mouse_up(&mut self, x: i32, y: i32) {
 		if let Some(drag) = self.drag.take() {
-			if !drag.moved {
+			let insert = self.mode == Mode::Insert;
+			let reporting = self
+				.pane(drag.pane)
+				.map(|p| match &p.body {
+					Body::Term(term) => term.screen.modes.mouse_mode != MouseMode::None,
+					_ => false,
+				})
+				.unwrap_or(false);
+			if reporting && insert {
+				self.send_mouse(drag.pane, x, y, 0, true, false);
+			} else if !drag.moved {
+				// A plain click without a drag leaves no one-cell selection behind.
 				if let Some(pane) = self.pane_mut(drag.pane) {
 					if let Body::Term(term) = &mut pane.body {
 						term.selection = None;
-					}
-				}
-			}
-			let shift = unsafe { GetKeyState(VK_SHIFT as i32) < 0 };
-			if let Some(pane) = self.pane(drag.pane) {
-				if let Body::Term(term) = &pane.body {
-					if term.screen.modes.mouse_mode != MouseMode::None && !shift {
-						let _ = self.send_mouse(drag.pane, x, y, 0, true, false);
 					}
 				}
 			}
@@ -1882,59 +1997,71 @@ impl App {
 	}
 
 	fn mouse_double(&mut self, x: i32, y: i32) {
-		let Some(id) = self.mouse_target(x, y) else { return };
-		let Some(rect) = self.pane_rect(id) else { return };
-		let ch = self.canvas.cell_h;
-		let cw = self.canvas.cell_w;
-		let row = ((y - rect.top) / ch).max(0) as usize;
-		let col = ((x - rect.left) / cw).max(0) as usize;
+		let Some(id) = self.mouse_target(x, y) else {
+			return;
+		};
+		let Some((row, col)) = self.screen_cell(id, x, y) else {
+			return;
+		};
 		if let Some(pane) = self.pane_mut(id) {
 			if let Body::Solid(editor) = &mut pane.body {
-				let line = editor.scroll + row;
-				if line < editor.lines.len() {
-					let col = editor_col_at(editor, line, col + editor.hscroll);
-					editor.select_word(line, col);
-				}
+				editor.double_click_screen(row, col);
 			}
 		}
 	}
 
-	fn editor_click(&mut self, id: PaneId, x: i32, y: i32, extend: bool) {
-		let Some(rect) = self.pane_rect(id) else { return };
-		if y >= rect.bottom || x >= rect.right {
-			return;
+	fn screen_cell(&self, id: PaneId, x: i32, y: i32) -> Option<(usize, usize)> {
+		let rect = self.pane_rect(id)?;
+		let pane = self.pane(id)?;
+		if x < rect.left || y < rect.top || x >= rect.right || y >= rect.bottom {
+			return None;
 		}
-		let cw = self.canvas.cell_w;
-		let ch = self.canvas.cell_h;
-		let screen_row = ((y - rect.top) / ch).max(0) as usize;
-		let screen_col = ((x - rect.left) / cw).max(0) as usize;
-		if let Some(pane) = self.pane_mut(id) {
-			if let Body::Solid(editor) = &mut pane.body {
-				let row = (editor.scroll + screen_row).min(editor.lines.len() - 1);
-				let col = editor_col_at(editor, row, screen_col + editor.hscroll);
-				editor.set_cursor(row, col, extend);
-			}
-		}
+		let cw = pane.cell.0.max(1);
+		let ch = pane.cell.1.max(1);
+		Some((
+			((y - rect.top) / ch).max(0) as usize,
+			((x - rect.left) / cw).max(0) as usize,
+		))
+	}
+
+	fn body_cells(&self, id: PaneId) -> Option<(usize, usize)> {
+		let rect = self.pane_rect(id)?;
+		let pane = self.pane(id)?;
+		let cw = pane.cell.0.max(1);
+		let ch = pane.cell.1.max(1);
+		Some((
+			(rect.width() / cw).max(1) as usize,
+			(rect.height() / ch).max(1) as usize,
+		))
 	}
 
 	fn mouse_wheel(&mut self, x: i32, y: i32, delta: i32) {
 		if delta == 0 {
 			return;
 		}
+		if matches!(self.modal, Some(Modal::PaneLimit { .. })) {
+			let max = self.pane_list_len().saturating_sub(PANE_LIST_ROWS) as isize;
+			if let Some(Modal::PaneLimit { scroll }) = &mut self.modal {
+				*scroll = (*scroll - delta as isize * 3).clamp(0, max);
+			}
+			return;
+		}
 		let id = self.mouse_target(x, y).or_else(|| self.focused_id());
 		let Some(id) = id else { return };
-		let shift = unsafe { GetKeyState(VK_SHIFT as i32) < 0 };
-		let steps = (delta.abs().max(1)) as isize * 3;
+		let insert = self.mode == Mode::Insert;
+		let notches = delta.abs().max(1) as isize;
 		let up = delta > 0;
+		let steps = notches * 3;
 		let mut wheel_button = None;
 		if let Some(pane) = self.pane_mut(id) {
 			match &mut pane.body {
 				Body::Term(term) => {
-					if term.screen.modes.mouse_mode != MouseMode::None && !shift {
+					if insert && term.screen.modes.mouse_mode != MouseMode::None {
+						// The program asked for mouse reports, so the wheel is its.
 						wheel_button = Some(if up { 64 } else { 65 });
 					} else if term.alt && term.screen.modes.alt_scroll {
 						let seq = if up { b"\x1b[A" as &[u8] } else { b"\x1b[B" };
-						for _ in 0..3 {
+						for _ in 0..steps {
 							term.write(seq);
 						}
 					} else if up {
@@ -1944,37 +2071,52 @@ impl App {
 					}
 				}
 				Body::Solid(editor) => {
-					if up {
-						editor.move_cursor(-3, 0, false);
-					} else {
-						editor.move_cursor(3, 0, false);
-					}
+					editor.wheel(if up { -(steps as i32) } else { steps as i32 });
 				}
 				Body::Even(group) => {
-					group.scroll(if up { steps as i32 } else { -(steps as i32) });
+					group.wheel(delta);
 				}
 			}
 		}
 		if let Some(button) = wheel_button {
-			for _ in 0..3 {
+			for _ in 0..steps {
 				self.send_mouse(id, x, y, button, false, false);
 			}
 		}
 	}
 
-	fn send_mouse(&self, id: PaneId, x: i32, y: i32, button: i32, release: bool, motion: bool) -> bool {
-		let Some(rect) = self.pane_rect(id) else { return false };
-		let Some(pane) = self.pane(id) else { return false };
-		if let Owner::Agent(_) = pane.owner {
+	fn pane_list_len(&self) -> usize {
+		let Some(tab) = self.tabs.get(self.active) else {
+			return 0;
+		};
+		let drawn = Self::drawn_ids(tab);
+		drawn.len() + tab.hidden.iter().filter(|id| !drawn.contains(id)).count()
+	}
+
+	fn send_mouse(
+		&self,
+		id: PaneId,
+		x: i32,
+		y: i32,
+		button: i32,
+		release: bool,
+		motion: bool,
+	) -> bool {
+		let Some(rect) = self.pane_rect(id) else {
 			return false;
-		}
-		let Body::Term(term) = &pane.body else { return false };
+		};
+		let Some(pane) = self.pane(id) else {
+			return false;
+		};
+		let Body::Term(term) = &pane.body else {
+			return false;
+		};
 		let mode = term.screen.modes.mouse_mode;
 		if mode == MouseMode::None {
 			return false;
 		}
-		let cw = self.canvas.cell_w;
-		let ch = self.canvas.cell_h;
+		let cw = pane.cell.0.max(1);
+		let ch = pane.cell.1.max(1);
 		let cx = (((x - rect.left) / cw) + 1).clamp(1, 1000) as i32;
 		let cy = (((y - rect.top) / ch) + 1).clamp(1, 1000) as i32;
 		let mut b = button;
@@ -1983,7 +2125,13 @@ impl App {
 		}
 		let seq = match term.screen.modes.mouse_encoding {
 			MouseEncoding::Sgr => {
-				format!("\x1b[<{};{};{}{}", b, cx, cy, if release { 'm' } else { 'M' })
+				format!(
+					"\x1b[<{};{};{}{}",
+					b,
+					cx,
+					cy,
+					if release { 'm' } else { 'M' }
+				)
 			}
 			MouseEncoding::Utf8 => {
 				let mut out = String::from("\x1b[M");
@@ -1995,7 +2143,14 @@ impl App {
 				out
 			}
 			_ => {
-				let bytes = [27u8, b'[', b'M', (32 + b).min(255) as u8, (32 + cx).min(255) as u8, (32 + cy).min(255) as u8];
+				let bytes = [
+					27u8,
+					b'[',
+					b'M',
+					(32 + b).min(255) as u8,
+					(32 + cx).min(255) as u8,
+					(32 + cy).min(255) as u8,
+				];
 				String::from_utf8_lossy(&bytes).into_owned()
 			}
 		};
@@ -2010,24 +2165,36 @@ impl App {
 		}
 		for pane in self.tabs.iter().flat_map(|tab| tab.panes.values()) {
 			if let Owner::Agent(agent) | Owner::Share(agent) = &pane.owner {
-				self.modal = Some(Modal::CloseAgent { pane: pane.id, agent: agent.clone() });
+				self.modal = Some(Modal::CloseAgent {
+					pane: pane.id,
+					agent: agent.clone(),
+				});
 				return;
 			}
 			if let Body::Solid(editor) = &pane.body {
 				if editor.modified {
 					let id = pane.id;
 					self.focus_pane_anywhere(id);
-					self.modal = Some(Modal::Notice(String::from("文件尚未保存，窗口没有关闭。先在 solid 按 Ctrl+S 保存。")));
+					self.modal = Some(Modal::Notice(String::from(
+						"文件尚未保存，窗口没有关闭。先在 solid 按 Ctrl+S 保存。",
+					)));
 					return;
 				}
 			}
 		}
-		unsafe { DestroyWindow(self.hwnd); }
+		unsafe {
+			DestroyWindow(self.hwnd);
+		}
 	}
 
 	fn request_close_pane(&mut self, id: PaneId) {
-		if self.pane(id).is_some_and(|pane| matches!(&pane.body, Body::Solid(editor) if editor.modified)) {
-			self.modal = Some(Modal::Notice(String::from("文件尚未保存，窗口没有关闭。先在 solid 按 Ctrl+S 保存。")));
+		if self
+			.pane(id)
+			.is_some_and(|pane| matches!(&pane.body, Body::Solid(editor) if editor.modified))
+		{
+			self.modal = Some(Modal::Notice(String::from(
+				"文件尚未保存，窗口没有关闭。先在 solid 按 Ctrl+S 保存。",
+			)));
 			return;
 		}
 		if self.events.iter().any(|e| e.pane == id) {
@@ -2045,12 +2212,16 @@ impl App {
 	}
 
 	fn request_close_tab(&mut self) {
-		let Some(tab) = self.tabs.get(self.active) else { return };
+		let Some(tab) = self.tabs.get(self.active) else {
+			return;
+		};
 		if let Some(id) = tab.panes.values().find_map(|pane| {
 			matches!(&pane.body, Body::Solid(editor) if editor.modified).then_some(pane.id)
 		}) {
 			self.focus_pane_anywhere(id);
-			self.modal = Some(Modal::Notice(String::from("标签中有文件尚未保存，没有关闭。先在 solid 按 Ctrl+S 保存。")));
+			self.modal = Some(Modal::Notice(String::from(
+				"标签中有文件尚未保存，没有关闭。先在 solid 按 Ctrl+S 保存。",
+			)));
 			return;
 		}
 		if let Some(event) = self.events.iter().find(|e| tab.panes.contains_key(&e.pane)) {
@@ -2073,7 +2244,10 @@ impl App {
 	}
 
 	fn remove_pane_direct(&mut self, id: PaneId) {
-		let is_group = self.pane(id).map(|p| matches!(p.body, Body::Even(_)) && p.group_id != 0).unwrap_or(false);
+		let is_group = self
+			.pane(id)
+			.map(|p| matches!(p.body, Body::Even(_)) && p.group_id != 0)
+			.unwrap_or(false);
 		if is_group {
 			let group = self.pane(id).map(|p| p.group_id).unwrap_or(0);
 			let pages: Vec<PaneId> = self
@@ -2097,7 +2271,9 @@ impl App {
 	}
 
 	fn remove_single(&mut self, id: PaneId) {
-		let Some(index) = self.tab_index_of(id) else { return };
+		let Some(index) = self.tab_index_of(id) else {
+			return;
+		};
 		let last = self.tabs[index].panes.len() <= 1;
 		if last {
 			let gone: Vec<PaneId> = self.tabs[index].panes.keys().copied().collect();
@@ -2129,9 +2305,13 @@ impl App {
 	}
 
 	fn close_tab_direct(&mut self, index: usize) {
-		let Some(tab) = self.tabs.get(index) else { return };
+		let Some(tab) = self.tabs.get(index) else {
+			return;
+		};
 		let ids: Vec<PaneId> = tab.panes.keys().copied().collect();
-		let Some(anchor) = ids.first().copied() else { return };
+		let Some(anchor) = ids.first().copied() else {
+			return;
+		};
 		let mut groups: Vec<u64> = tab
 			.panes
 			.values()
@@ -2180,7 +2360,12 @@ impl App {
 	}
 
 	fn stop_events_for(&mut self, pane: PaneId) {
-		let ids: Vec<u64> = self.events.iter().filter(|e| e.pane == pane).map(|e| e.id).collect();
+		let ids: Vec<u64> = self
+			.events
+			.iter()
+			.filter(|e| e.pane == pane)
+			.map(|e| e.id)
+			.collect();
 		for id in ids {
 			self.stop_event(id);
 		}
@@ -2201,7 +2386,9 @@ impl App {
 	}
 
 	fn stop_event(&mut self, id: u64) {
-		let Some(event) = self.events.iter().find(|e| e.id == id).cloned() else { return };
+		let Some(event) = self.events.iter().find(|e| e.id == id).cloned() else {
+			return;
+		};
 		if let Some(pane) = self.pane(event.pane) {
 			match &pane.body {
 				Body::Even(group) => {
@@ -2242,13 +2429,21 @@ impl App {
 					self.open_member_page(pane, group, &name, &session);
 				}
 				EvenEvent::Stopping { name } => {
-					if let Some(Pane { body: Body::Even(group), .. }) = self.pane(pane) {
+					if let Some(Pane {
+						body: Body::Even(group),
+						..
+					}) = self.pane(pane)
+					{
 						let agent = format!("{}:{name}", group.name);
 						self.cancel_takeovers(&agent);
 					}
 				}
 				EvenEvent::Stopped { name } => {
-					if let Some(Pane { body: Body::Even(group), .. }) = self.pane(pane) {
+					if let Some(Pane {
+						body: Body::Even(group),
+						..
+					}) = self.pane(pane)
+					{
 						let agent = format!("{}:{name}", group.name);
 						self.release_agent(&agent);
 					}
@@ -2264,8 +2459,12 @@ impl App {
 		let requests = std::mem::take(&mut self.pending_takeovers);
 		for request in requests {
 			if request.agent == agent {
-				request.cancelled.store(true, std::sync::atomic::Ordering::Release);
-				let _ = request.reply.send(Err(String::from("成员已请求停止，未执行接管操作")));
+				request
+					.cancelled
+					.store(true, std::sync::atomic::Ordering::Release);
+				let _ = request
+					.reply
+					.send(Err(String::from("成员已请求停止，未执行接管操作")));
 			} else {
 				self.pending_takeovers.push(request);
 			}
@@ -2275,15 +2474,22 @@ impl App {
 	fn release_agent(&mut self, agent: &str) {
 		self.cancel_takeovers(agent);
 		self.auth.retain(|(_, owner), _| owner != agent);
-		let events: Vec<u64> = self.events.iter()
+		let events: Vec<u64> = self
+			.events
+			.iter()
 			.filter(|event| event.member.as_deref() == Some(agent))
-			.map(|event| event.id).collect();
+			.map(|event| event.id)
+			.collect();
 		for id in events {
 			self.stop_event(id);
 		}
-		let panes: Vec<PaneId> = self.tabs.iter().flat_map(|tab| tab.panes.values())
+		let panes: Vec<PaneId> = self
+			.tabs
+			.iter()
+			.flat_map(|tab| tab.panes.values())
 			.filter(|pane| matches!(&pane.owner, Owner::Agent(owner) if owner == agent))
-			.map(|pane| pane.id).collect();
+			.map(|pane| pane.id)
+			.collect();
 		for id in panes {
 			self.clear_owner_if_idle(id);
 		}
@@ -2302,7 +2508,9 @@ impl App {
 			return;
 		}
 		let Some(server_url) = self.server.as_ref().map(|server| server.client.url.clone()) else {
-			self.modal = Some(Modal::Notice(String::from("opencode server 没有起来，打不开 AI 页面。")));
+			self.modal = Some(Modal::Notice(String::from(
+				"opencode server 没有起来，打不开 AI 页面。",
+			)));
 			return;
 		};
 		// The ConPTY console starts on the system ANSI code page; opencode writes
@@ -2310,10 +2518,25 @@ impl App {
 		// same console before opencode, whose own console test fixture sets both
 		// code pages to 65001 the same way. The outer quotes let cmd keep the
 		// quoted program path; taskkill /T still takes the whole tree on close.
-		let program = format!("\"{}\" --server {} --session {}", crate::opencode::program(), server_url, session);
+		let program = format!(
+			"\"{}\" --server {} --session {}",
+			crate::opencode::program(),
+			server_url,
+			session
+		);
 		let command = format!("cmd /d /s /c \"chcp 65001>nul & {program}\"");
-		let Some(tab_index) = self.tab_index_of(group_pane) else { return };
-		let _ = self.add_terminal(tab_index, &command, Owner::Normal, false, group, Some(String::from(name)), true);
+		let Some(tab_index) = self.tab_index_of(group_pane) else {
+			return;
+		};
+		let _ = self.add_terminal(
+			tab_index,
+			&command,
+			Owner::Normal,
+			false,
+			group,
+			Some(String::from(name)),
+			true,
+		);
 	}
 
 	fn close_member_page(&mut self, group: u64, name: &str) {
@@ -2347,8 +2570,19 @@ impl App {
 			if members.is_empty() {
 				continue;
 			}
-			let label = format!("even 里 {} 正在处理", members.iter().map(|m| format!("@{m}")).collect::<Vec<_>>().join(" "));
-			let single = if members.len() == 1 { Some(members[0].clone()) } else { None };
+			let label = format!(
+				"even 里 {} 正在处理",
+				members
+					.iter()
+					.map(|m| format!("@{m}"))
+					.collect::<Vec<_>>()
+					.join(" ")
+			);
+			let single = if members.len() == 1 {
+				Some(members[0].clone())
+			} else {
+				None
+			};
 			let found = self
 				.events
 				.iter()
@@ -2374,8 +2608,14 @@ impl App {
 			.events
 			.iter()
 			.filter(|e| {
-				let is_group = self.pane(e.pane).map(|p| matches!(p.body, Body::Even(_))).unwrap_or(false);
-				is_group && !busy.iter().any(|(pane, members)| *pane == e.pane && !members.is_empty())
+				let is_group = self
+					.pane(e.pane)
+					.map(|p| matches!(p.body, Body::Even(_)))
+					.unwrap_or(false);
+				is_group
+					&& !busy
+						.iter()
+						.any(|(pane, members)| *pane == e.pane && !members.is_empty())
 			})
 			.map(|e| (e.id, e.pane))
 			.collect();
@@ -2391,7 +2631,8 @@ impl App {
 			.map(|e| e.pane)
 			.collect();
 		if !expired.is_empty() {
-			self.events.retain(|e| e.expires.map(|t| now < t).unwrap_or(true));
+			self.events
+				.retain(|e| e.expires.map(|t| now < t).unwrap_or(true));
 			for pane in expired {
 				self.clear_owner_if_idle(pane);
 			}
@@ -2412,7 +2653,9 @@ impl App {
 		for mut request in requests {
 			if let Some(session) = &request.session {
 				let Some(agent) = self.session_agent(session) else {
-					let _ = request.reply.send(Err(String::from("这个 even 成员正在停止或已经不存在")));
+					let _ = request
+						.reply
+						.send(Err(String::from("这个 even 成员正在停止或已经不存在")));
 					continue;
 				};
 				request.agent = agent;
@@ -2433,36 +2676,54 @@ impl App {
 		}
 		self.pending_takeovers.retain(|request| request.is_active());
 		if let Some(Modal::Takeover { pane, agent }) = &self.modal {
-			if !self.pending_takeovers.iter().any(|r| r.args["id"].as_u64() == Some(*pane as u64) && r.agent == *agent) {
+			if !self
+				.pending_takeovers
+				.iter()
+				.any(|r| r.args["id"].as_u64() == Some(*pane as u64) && r.agent == *agent)
+			{
 				self.modal = None;
 			}
 		}
 		if self.modal.is_none() {
 			if let Some(request) = self.pending_takeovers.first() {
 				if let Ok(pane) = self.parse_id(&request.args) {
-					self.modal = Some(Modal::Takeover { pane, agent: request.agent.clone() });
+					self.modal = Some(Modal::Takeover {
+						pane,
+						agent: request.agent.clone(),
+					});
 				}
 			}
 		}
 	}
 
 	fn session_agent(&self, session: &str) -> Option<String> {
-		self.tabs.iter().flat_map(|tab| tab.panes.values()).find_map(|pane| {
-			let Body::Even(group) = &pane.body else { return None };
-			if !group.session_can_act(session) {
-				return None;
-			}
-			group.member_sessions().into_iter()
-				.find(|(_, id)| id == session)
-				.map(|(name, _)| format!("{}:{name}", group.name))
-		})
+		self.tabs
+			.iter()
+			.flat_map(|tab| tab.panes.values())
+			.find_map(|pane| {
+				let Body::Even(group) = &pane.body else {
+					return None;
+				};
+				if !group.session_can_act(session) {
+					return None;
+				}
+				group
+					.member_sessions()
+					.into_iter()
+					.find(|(_, id)| id == session)
+					.map(|(name, _)| format!("{}:{name}", group.name))
+			})
 	}
 
 	fn needs_takeover(&self, id: PaneId, agent: &str) -> bool {
 		self.pane(id).is_some_and(|pane| {
 			pane.owner == Owner::Normal
 				&& !self.auth.contains_key(&(id, agent.to_string()))
-				&& (pane.seen || pane.creator.as_deref().is_some_and(|creator| creator != agent))
+				&& (pane.seen
+					|| pane
+						.creator
+						.as_deref()
+						.is_some_and(|creator| creator != agent))
 		})
 	}
 
@@ -2475,11 +2736,19 @@ impl App {
 			}
 			let result = if !request.is_active() {
 				Err(String::from("接管请求已过期，没有执行"))
-			} else if request.session.as_ref().is_some_and(|session| self.session_agent(session).is_none()) {
+			} else if request
+				.session
+				.as_ref()
+				.is_some_and(|session| self.session_agent(session).is_none())
+			{
 				Err(String::from("这个 even 成员正在停止或已经不存在"))
 			} else if !approved {
-				Err(String::from("人拒绝了接管，没有执行；不要重试或改用其他窗口绕过拒绝。"))
-			} else if self.pane(pane).is_none_or(|p| p.owner != Owner::Normal && p.owner != Owner::Agent(agent.to_string())) {
+				Err(String::from(
+					"人拒绝了接管，没有执行；不要重试或改用其他窗口绕过拒绝。",
+				))
+			} else if self.pane(pane).is_none_or(|p| {
+				p.owner != Owner::Normal && p.owner != Owner::Agent(agent.to_string())
+			}) {
 				Err(String::from("窗口已经关闭或归属已改变，没有执行"))
 			} else {
 				self.grant_agent(pane, agent)
@@ -2490,20 +2759,26 @@ impl App {
 	}
 
 	fn parse_id(&self, args: &Value) -> Result<PaneId, String> {
-		args["id"].as_u64().map(|v| v as PaneId).ok_or_else(|| String::from("缺少 id"))
+		args["id"]
+			.as_u64()
+			.map(|v| v as PaneId)
+			.ok_or_else(|| String::from("缺少 id"))
 	}
 
 	fn mcp_tool(&mut self, tool: &str, args: &Value, agent: &str) -> Result<Value, String> {
 		match tool {
 			"list_windows" => {
 				let cols = (self.width / self.canvas.cell_w.max(1)).max(1);
-				let rows = ((self.height - self.canvas.cell_h).max(1) / self.canvas.cell_h.max(1)).max(1);
+				let rows =
+					((self.height - self.canvas.cell_h).max(1) / self.canvas.cell_h.max(1)).max(1);
 				let mut tabs = Vec::new();
 				for (index, tab) in self.tabs.iter().enumerate() {
 					let mut panes = Vec::new();
 					let drawn: Vec<PaneId> = tab.saved.as_ref().unwrap_or(&tab.layout).leaves();
 					for id in drawn.iter().copied().chain(tab.hidden.iter().copied()) {
-						let Some(pane) = tab.panes.get(&id) else { continue };
+						let Some(pane) = tab.panes.get(&id) else {
+							continue;
+						};
 						let events: Vec<Value> = self
 							.events
 							.iter()
@@ -2521,9 +2796,13 @@ impl App {
 							"events": events,
 						}));
 					}
-					tabs.push(json!({"tab": index + 1, "active": index == self.active, "panes": panes}));
+					tabs.push(
+						json!({"tab": index + 1, "active": index == self.active, "panes": panes}),
+					);
 				}
-				Ok(json!({"text": serde_json::to_string_pretty(&json!({"cols": cols, "rows": rows, "tabs": tabs})).unwrap_or_default()}))
+				Ok(
+					json!({"text": serde_json::to_string_pretty(&json!({"cols": cols, "rows": rows, "tabs": tabs})).unwrap_or_default()}),
+				)
 			}
 			"read_window" => {
 				let id = self.parse_id(args)?;
@@ -2537,18 +2816,44 @@ impl App {
 			}
 			"write_window" => {
 				let id = self.parse_id(args)?;
-				let text = args["text"].as_str().ok_or_else(|| String::from("缺少 text"))?;
+				let text = args["text"]
+					.as_str()
+					.ok_or_else(|| String::from("缺少 text"))?;
 				self.agent_access(id, agent)?;
-				let Some(pane) = self.pane_mut(id) else { return Err(format!("没有窗口 {id}")) };
-				let Body::Solid(editor) = &mut pane.body else { return Err(String::from("这个窗口不是 solid")) };
+				let Some(pane) = self.pane_mut(id) else {
+					return Err(format!("没有窗口 {id}"));
+				};
+				let Body::Solid(editor) = &mut pane.body else {
+					return Err(String::from("这个窗口不是 solid"));
+				};
 				editor.replace_all(text);
-				editor.save().map_err(|err| format!("窗口内容已更新但文件保存失败：{err}"))?;
+				editor
+					.save()
+					.map_err(|err| format!("窗口内容已更新但文件保存失败：{err}"))?;
+				// 文件编辑事件绑在这个窗口上：事件还在，窗口就不能关。
+				// 写是同步完成的；事件留一会儿，让人看见文件被改过。
+				self.events
+					.retain(|e| e.pane != id || e.kind != EventKind::AiEdit);
+				let event_id = self.next_event;
+				self.next_event += 1;
+				self.events.push(EventRecord {
+					id: event_id,
+					pane: id,
+					kind: EventKind::AiEdit,
+					label: format!("{agent} 编辑了这个文件"),
+					member: Some(agent.to_string()),
+					expires: Some(Instant::now() + AI_EDIT_EVENT_TTL),
+				});
 				self.note_ai(id);
-				Ok(json!({"text": format!("已写入窗口 {id} 并保存文件")}))
+				Ok(
+					json!({"text": format!("已写入窗口 {id} 并保存文件；事件 {event_id} 绑着这个窗口，稍后自动释放")}),
+				)
 			}
 			"run_in_terminal" => {
 				let id = self.parse_id(args)?;
-				let command = args["command"].as_str().ok_or_else(|| String::from("缺少 command"))?;
+				let command = args["command"]
+					.as_str()
+					.ok_or_else(|| String::from("缺少 command"))?;
 				self.agent_access(id, agent)?;
 				if let Some(event) = self.events.iter().find(|e| e.pane == id) {
 					return Err(format!(
@@ -2556,8 +2861,12 @@ impl App {
 						event.id, event.label, event.id
 					));
 				}
-				let Some(pane) = self.pane_mut(id) else { return Err(format!("没有窗口 {id}")) };
-				let Body::Term(term) = &mut pane.body else { return Err(String::from("这个窗口不是 terminal")) };
+				let Some(pane) = self.pane_mut(id) else {
+					return Err(format!("没有窗口 {id}"));
+				};
+				let Body::Term(term) = &mut pane.body else {
+					return Err(String::from("这个窗口不是 terminal"));
+				};
 				term.write(command.as_bytes());
 				term.write(b"\r");
 				let event_id = self.next_event;
@@ -2571,7 +2880,9 @@ impl App {
 					expires: None,
 				});
 				self.note_ai(id);
-				Ok(json!({"text": format!("已在窗口 {id} 输入命令；事件 {event_id} 绑着这个窗口，用 stop_event {event_id} 释放")}))
+				Ok(
+					json!({"text": format!("已在窗口 {id} 输入命令；事件 {event_id} 绑着这个窗口，用 stop_event {event_id} 释放")}),
+				)
 			}
 			"create_window" => {
 				let kind = args["kind"].as_str().unwrap_or("terminal");
@@ -2579,12 +2890,15 @@ impl App {
 				let before = self.focused_id();
 				let id = match kind {
 					"solid" => {
-						let path = args["path"].as_str().ok_or_else(|| String::from("solid 需要 path"))?;
+						let path = args["path"]
+							.as_str()
+							.ok_or_else(|| String::from("solid 需要 path"))?;
 						let path = PathBuf::from(path);
 						if let Some(id) = self.find_solid(&path) {
 							return Ok(json!({"text": format!("窗口 {id} 已经打开这个文件")}));
 						}
-						let editor = Editor::open(path, false).map_err(|err| format!("文件没有打开：{err}"))?;
+						let editor = Editor::open(path, false)
+							.map_err(|err| format!("文件没有打开：{err}"))?;
 						let id = self.next_pane;
 						self.next_pane += 1;
 						self.add_tab(id, Body::Solid(editor), Owner::Normal, true, 0, None, false);
@@ -2594,17 +2908,29 @@ impl App {
 						let group_id = self.next_group;
 						self.next_group += 1;
 						let name = format!("even{group_id}");
-						let root = std::env::current_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+						let root = std::env::current_dir()
+							.map(|p| p.to_string_lossy().into_owned())
+							.unwrap_or_default();
 						let group = GroupPane::new(&name, &root, self.client.clone());
 						let id = self.next_pane;
 						self.next_pane += 1;
-						self.add_tab(id, Body::Even(Box::new(group)), Owner::Normal, true, group_id, None, false);
+						self.add_tab(
+							id,
+							Body::Even(Box::new(group)),
+							Owner::Normal,
+							true,
+							group_id,
+							None,
+							false,
+						);
 						Some(id)
 					}
 					_ => {
 						let command = args["command"].as_str().unwrap_or(&self.shell).to_string();
 						let envs = self.child_env.clone();
-						let (id, term) = self.spawn_term(&command, &envs).ok_or_else(|| String::from("终端没有启动"))?;
+						let (id, term) = self
+							.spawn_term(&command, &envs)
+							.ok_or_else(|| String::from("终端没有启动"))?;
 						self.add_tab(id, Body::Term(term), Owner::Normal, true, 0, None, false);
 						Some(id)
 					}
@@ -2624,10 +2950,17 @@ impl App {
 			"close_window" => {
 				let id = self.parse_id(args)?;
 				if self.events.iter().any(|e| e.pane == id) {
-					let list: Vec<String> = self.events.iter().filter(|e| e.pane == id).map(|e| format!("#{} {}", e.id, e.label)).collect();
+					let list: Vec<String> = self
+						.events
+						.iter()
+						.filter(|e| e.pane == id)
+						.map(|e| format!("#{} {}", e.id, e.label))
+						.collect();
 					return Err(format!("窗口 {id} 绑着事件，不能关：{}", list.join("；")));
 				}
-				let Some(pane) = self.pane(id) else { return Err(format!("没有窗口 {id}")) };
+				let Some(pane) = self.pane(id) else {
+					return Err(format!("没有窗口 {id}"));
+				};
 				if matches!(&pane.body, Body::Solid(editor) if editor.modified) {
 					return Err(String::from("文件尚未保存，不能关闭"));
 				}
@@ -2645,7 +2978,9 @@ impl App {
 					.iter()
 					.map(|e| json!({"id": e.id, "pane": e.pane, "kind": "task", "label": e.label}))
 					.collect();
-				Ok(json!({"text": serde_json::to_string_pretty(&json!({"events": events})).unwrap_or_default()}))
+				Ok(
+					json!({"text": serde_json::to_string_pretty(&json!({"events": events})).unwrap_or_default()}),
+				)
 			}
 			"stop_event" => {
 				let id = self.parse_id(args).map(|v| v as u64)?;
@@ -2653,13 +2988,18 @@ impl App {
 					return Err(format!("没有事件 {id}"));
 				}
 				let event = self.events.iter().find(|e| e.id == id).unwrap();
-				let pane = self.pane(event.pane).ok_or_else(|| String::from("窗口已关闭"))?;
+				let pane = self
+					.pane(event.pane)
+					.ok_or_else(|| String::from("窗口已关闭"))?;
 				if !matches!(&pane.owner, Owner::Agent(owner) if owner == agent)
-					&& event.member.as_deref() != Some(agent) {
+					&& event.member.as_deref() != Some(agent)
+				{
 					return Err(String::from("不能停止其他成员或人的任务"));
 				}
 				self.stop_event(id);
-				Ok(json!({"text": format!("已请求停止事件 {id}；以 list_events 和 read_window 的实际结果为准")}))
+				Ok(
+					json!({"text": format!("已请求停止事件 {id}；以 list_events 和 read_window 的实际结果为准")}),
+				)
 			}
 			"takeover_status" => {
 				let id = self.parse_id(args)?;
@@ -2667,8 +3007,8 @@ impl App {
 				let authorized = self.auth.contains_key(&(id, agent.to_string()));
 				let owned = matches!(&pane.owner, Owner::Agent(a) if a == agent);
 				let needs_request = pane.owner == Owner::Normal
-					&& !authorized
-					&& (pane.seen || (pane.creator.is_some() && pane.creator.as_deref() != Some(agent)));
+					&& !authorized && (pane.seen
+					|| (pane.creator.is_some() && pane.creator.as_deref() != Some(agent)));
 				Ok(json!({"text": serde_json::to_string_pretty(&json!({
 					"pane": id,
 					"owner": owner_label(&pane.owner),
@@ -2683,8 +3023,9 @@ impl App {
 	}
 
 	fn agent_access(&mut self, id: PaneId, agent: &str) -> Result<(), String> {
-		let Some((owner, seen, creator)) =
-			self.pane(id).map(|p| (p.owner.clone(), p.seen, p.creator.clone()))
+		let Some((owner, seen, creator)) = self
+			.pane(id)
+			.map(|p| (p.owner.clone(), p.seen, p.creator.clone()))
 		else {
 			return Err(format!("没有窗口 {id}"));
 		};
@@ -2709,7 +3050,9 @@ impl App {
 		let pane = self.pane_mut(id).ok_or_else(|| format!("没有窗口 {id}"))?;
 		if let Body::Solid(editor) = &mut pane.body {
 			if editor.modified {
-				editor.save().map_err(|err| format!("接管前保存失败，没有交给 AI：{err}"))?;
+				editor
+					.save()
+					.map_err(|err| format!("接管前保存失败，没有交给 AI：{err}"))?;
 			}
 		}
 		pane.owner = Owner::Agent(agent.to_string());
@@ -2784,9 +3127,9 @@ impl App {
 					self.modal = Some(Modal::CloseAgent { pane, agent });
 				}
 			}
-			Some(Modal::PaneLimit) => match key.ch {
+			Some(Modal::PaneLimit { scroll }) => match key.ch {
 				Some(ch @ '1'..='6') => self.set_pane_limit((ch as u8 - b'0') as usize),
-				_ => self.modal = Some(Modal::PaneLimit),
+				_ => self.modal = Some(Modal::PaneLimit { scroll }),
 			},
 			None => {}
 		}
@@ -2795,22 +3138,50 @@ impl App {
 	fn modal_lines(&self) -> (String, Vec<String>) {
 		match &self.modal {
 			Some(Modal::Help) => {
-				let mcp = self.mcp.as_ref().map(|m| m.url.clone()).unwrap_or_else(|| String::from("(MCP 没有起来)"));
+				let mcp = self
+					.mcp
+					.as_ref()
+					.map(|m| m.url.clone())
+					.unwrap_or_else(|| String::from("(MCP 没有起来)"));
 				(
 					String::from("Delta 帮助"),
 					vec![
-						String::from("普通 / 输入模式：F1 回普通（AI 窗口回 agent）；Esc 永远原样送给程序"),
-						String::from("普通：c 新标签  % 右分屏  \" 下分屏  x 关窗口  & 关标签"),
-						String::from("      z 缩放  o 轮换窗口  方向键换窗口  Ctrl+方向键调大小"),
-						String::from("      n 下一个标签  p 同屏窗口数  1-9 选标签  w 标签列表  [ 滚屏/复制模式"),
-						String::from("      ! 拆成新标签  q 窗口编号  e 打开文件  g 群聊  ? 帮助"),
-						String::from("输入：Enter 回车  Ctrl+V 粘贴（图片落成路径）  F1 回普通"),
-						String::from("鼠标：拖动选择；普通模式下 Ctrl+C 复制；终端要鼠标时按 Shift 拖动仍可选中"),
-						String::from("接管：读窗口不用申请；写入/接管要窗口归属或人批准；批准会记住"),
+						String::from("普通 / 输入：F1 回普通（AI 窗口回 agent）"),
+						String::from("普通（agent 同）：所有键归 Delta，不送给程序"),
+						String::from(
+							"  c 新标签  x 关窗口  & 关标签  z 缩放  方向键换窗口  q 窗口编号",
+						),
+						String::from(
+							"  n 下一个标签  p 窗口列表 / 同屏数  1-9 选标签  w 标签列表  [ 滚屏模式",
+						),
+						String::from("  ! 拆成新标签  ? 帮助  i 进输入（AI 窗口进 share）"),
+						String::from("  o odd  e even  s 选文件开 solid"),
+						String::from("  Ctrl+方向键调大小  Ctrl+= / Ctrl+- / Ctrl+滚轮 放大缩小窗口字体"),
+						String::from("  Ctrl+C 复制选区  Ctrl+V 粘贴"),
+						String::from(
+							"输入（share 同）：只有 F1-F12 留在 Delta（F1 回普通，F2-F12 暂无作用），",
+						),
+						String::from("  其余按键和鼠标原样交给程序"),
+						String::from("  solid：Ctrl+A 全选  Ctrl+C 复制  Ctrl+X 剪切  Ctrl+V 粘贴"),
+						String::from(
+							"        Ctrl+Z 撤销  Ctrl+Shift+Z / Ctrl+Y 重做  Ctrl+S 保存",
+						),
+						String::from(
+							"  even：Ctrl+A 全选  Ctrl+C 复制  Ctrl+X 剪切（只剪输入行）  Ctrl+V 粘贴",
+						),
+						String::from("       Ctrl+Z / Ctrl+Y 撤销、重做"),
+						String::from(
+							"       粘贴图片写成 ![](临时路径)；Ctrl+单击图片路径或网址用系统默认程序打开",
+						),
+						String::from("  终端：Ctrl+C 等由前台程序自己决定；选字和滚历史回普通模式"),
+						String::from("鼠标：普通里拖动选字、滚轮看历史、Ctrl+滚轮缩放窗口；输入里拖动、滚轮交给程序"),
+						String::from(
+							"接管：读窗口不用申请；写入/接管要窗口归属或人批准；批准会记住",
+						),
 						String::from("关闭：有任务事件时拒绝并列出；AI 的窗口先停止任务"),
-						String::from("odd：默认终端就是 odd 本身，不用切换 shell；solid 用 e；even 用 g"),
-						String::from("solid：终端里 \"$SOLID\" <文件>；启动 Delta 时带 <文件>；已经运行时在现有窗口打开"),
-						String::from("终端里 Ctrl+C 原样送程序；solid 里 Ctrl+C 复制、Ctrl+S 保存"),
+						String::from(
+							"odd：默认终端就是 odd 本身；solid：终端里 \"$SOLID\" <文件> 或启动时带 <文件>",
+						),
 						format!("Delta MCP：{mcp}"),
 					],
 				)
@@ -2847,82 +3218,156 @@ impl App {
 				lines.push(String::from("按 1-9 切换；Esc 关闭"));
 				(String::from("标签"), lines)
 			}
-			Some(Modal::PaneLimit) => {
-				let marks: Vec<String> =
-					(1..=6).map(|n| if n == self.pane_limit { format!("[{n}]") } else { format!(" {n} ") }).collect();
-				(
-					String::from("同屏窗口数"),
-					vec![
-						marks.join(" "),
-						format!("现在最多显示 {} 个；按 1-6 设置，Esc 关闭", self.pane_limit),
-						String::from("已经显示的窗口不会被后来的挤掉；只有它关闭，才补进下一个。"),
-					],
-				)
+			Some(Modal::PaneLimit { .. }) => {
+				let marks: Vec<String> = (1..=6)
+					.map(|n| {
+						if n == self.pane_limit {
+							format!("[{n}]")
+						} else {
+							format!(" {n} ")
+						}
+					})
+					.collect();
+				let mut lines = vec![
+					marks.join(" "),
+					format!(
+						"最多显示 {} 个；按 1-6 设置；滚轮查看下列窗口；Esc 关闭",
+						self.pane_limit
+					),
+					format!("  #   {} 状态  名称", pad_text("类型", 9)),
+				];
+				if let Some(tab) = self.tabs.get(self.active) {
+					let drawn = Self::drawn_ids(tab);
+					let mut ids = drawn.clone();
+					ids.extend(tab.hidden.iter().copied().filter(|id| !drawn.contains(id)));
+					for id in ids {
+						let Some(pane) = tab.panes.get(&id) else {
+							continue;
+						};
+						let mark = if id == tab.focus { ">" } else { " " };
+						let state = if drawn.contains(&id) {
+							"显示"
+						} else {
+							"隐藏"
+						};
+						let mut row = format!(
+							"{mark}{id:>3}  {} {state}  {}",
+							pad_text(Self::pane_kind(pane), 9),
+							Self::pane_title(pane)
+						);
+						if !matches!(pane.owner, Owner::Normal) {
+							row.push_str("  ");
+							row.push_str(&owner_label(&pane.owner));
+						}
+						lines.push(row);
+					}
+				}
+				(String::from("窗口"), lines)
 			}
-			Some(Modal::Notice(text)) => (String::from("提示"), text.lines().map(String::from).collect()),
+			Some(Modal::Notice(text)) => (
+				String::from("提示"),
+				text.lines().map(String::from).collect(),
+			),
 			None => (String::new(), Vec::new()),
 		}
 	}
 
 	fn tab_title(&self, index: usize) -> String {
-		let Some(tab) = self.tabs.get(index) else { return String::new() };
-		let Some(pane) = tab.panes.get(&tab.focus) else { return String::new() };
+		let Some(tab) = self.tabs.get(index) else {
+			return String::new();
+		};
+		let Some(pane) = tab.panes.get(&tab.focus) else {
+			return String::new();
+		};
 		clip_text(&Self::pane_title(pane), 18)
 	}
 
 	fn paint(&mut self) {
+		self.canvas.select_font(canvas::FONT_SIZE);
 		let cw = self.canvas.cell_w;
 		let ch = self.canvas.cell_h;
 		let area = self.content_area();
 		self.canvas.clear();
-		self.canvas.fill(0, 0, self.width, self.height, canvas::rgb(28, 30, 40));
+		self.canvas
+			.fill(0, 0, self.width, self.height, canvas::rgb(28, 30, 40));
 		let active = self.active;
-		if let Some(tab) = self.tabs.get(active) {
-			let rects = self.rects_of(tab, area);
-			let focus = tab.focus;
+		let drawn = self
+			.tabs
+			.get(active)
+			.map(|tab| (self.rects_of(tab, area), tab.focus));
+		if let Some((rects, focus)) = drawn {
 			let show_cursor = self.mode != Mode::Normal && self.modal.is_none();
+			let canvas = &mut self.canvas;
 			let tab = &mut self.tabs[active];
 			for (id, rect) in &rects {
-				let Some(pane) = tab.panes.get_mut(id) else { continue };
+				let Some(pane) = tab.panes.get_mut(id) else {
+					continue;
+				};
+				// Window content uses its own point size; the geometry above stays
+				// on the base grid so Ctrl+= grows one window without moving borders.
+				canvas.select_font(pane.font);
 				let focused = *id == focus;
 				match &mut pane.body {
-					Body::Term(term) => term.render(&self.canvas, *rect, focused, show_cursor, None),
-					Body::Solid(editor) => editor.render(&self.canvas, *rect, focused, show_cursor),
-					Body::Even(group) => group.render(&self.canvas, *rect, focused),
+					Body::Term(term) => term.render(canvas, *rect, focused, show_cursor, None),
+					Body::Solid(editor) => editor.render(canvas, *rect, focused, show_cursor),
+					Body::Even(group) => group.render(canvas, *rect, focused),
 				}
 			}
+			canvas.select_font(canvas::FONT_SIZE);
 			for (id, rect) in &rects {
-				let Some(pane) = self.tabs[active].panes.get(id) else { continue };
+				let Some(pane) = tab.panes.get(id) else {
+					continue;
+				};
 				let focused = *id == focus;
 				// A pane an AI is holding keeps its owner colour whether or not it is
 				// focused; the inner line carries the focus instead.
 				let held_by_ai = matches!(&pane.owner, Owner::Agent(_) | Owner::Share(_));
 				let color = if focused && !held_by_ai {
-					canvas::rgb(canvas::BORDER_ACTIVE.0, canvas::BORDER_ACTIVE.1, canvas::BORDER_ACTIVE.2)
+					canvas::rgb(
+						canvas::BORDER_ACTIVE.0,
+						canvas::BORDER_ACTIVE.1,
+						canvas::BORDER_ACTIVE.2,
+					)
 				} else {
 					owner_color(&pane.owner)
 				};
 				if held_by_ai {
 					// A 1-pixel line disappears on the dark background; an unfocused AI
 					// pane must still show whose it is, so the owner band is 3 pixels.
-					self.canvas.fill(rect.left, rect.top, rect.right, rect.top + 3, color);
-					self.canvas.fill(rect.left, rect.bottom - 3, rect.right, rect.bottom, color);
-					self.canvas.fill(rect.left, rect.top, rect.left + 3, rect.bottom, color);
-					self.canvas.fill(rect.right - 3, rect.top, rect.right, rect.bottom, color);
+					canvas.fill(rect.left, rect.top, rect.right, rect.top + 3, color);
+					canvas.fill(rect.left, rect.bottom - 3, rect.right, rect.bottom, color);
+					canvas.fill(rect.left, rect.top, rect.left + 3, rect.bottom, color);
+					canvas.fill(rect.right - 3, rect.top, rect.right, rect.bottom, color);
 				} else {
-					self.canvas.outline(rect.left, rect.top, rect.right - 1, rect.bottom - 1, color);
+					canvas.outline(rect.left, rect.top, rect.right - 1, rect.bottom - 1, color);
 				}
 				if focused && held_by_ai {
 					// The owner band says who holds the pane, the inner line says it still
 					// has the keyboard focus.
-					let accent = canvas::rgb(canvas::BORDER_ACTIVE.0, canvas::BORDER_ACTIVE.1, canvas::BORDER_ACTIVE.2);
-					self.canvas.outline(rect.left + 4, rect.top + 4, rect.right - 5, rect.bottom - 5, accent);
+					let accent = canvas::rgb(
+						canvas::BORDER_ACTIVE.0,
+						canvas::BORDER_ACTIVE.1,
+						canvas::BORDER_ACTIVE.2,
+					);
+					canvas.outline(
+						rect.left + 4,
+						rect.top + 4,
+						rect.right - 5,
+						rect.bottom - 5,
+						accent,
+					);
 				}
 				if self.show_numbers {
 					let label = format!(" {} ", id);
 					let width = label.len() as i32 * cw;
-					self.canvas.fill(rect.left, rect.top, rect.left + width, rect.top + ch, canvas::rgb(60, 70, 90));
-					self.canvas.text(rect.left, rect.top, &label, canvas::rgb(240, 240, 240));
+					canvas.fill(
+						rect.left,
+						rect.top,
+						rect.left + width,
+						rect.top + ch,
+						canvas::rgb(60, 70, 90),
+					);
+					canvas.text(rect.left, rect.top, &label, canvas::rgb(240, 240, 240));
 				}
 				if held_by_ai {
 					let label = match &pane.owner {
@@ -2934,8 +3379,8 @@ impl App {
 					let label = clip_text(&label, room);
 					let width = label.width() as i32 * cw;
 					let x = (rect.right - width).max(rect.left);
-					self.canvas.fill(x, rect.top, rect.right, rect.top + ch, color);
-					self.canvas.text(x, rect.top, &label, canvas::rgb(20, 16, 26));
+					canvas.fill(x, rect.top, rect.right, rect.top + ch, color);
+					canvas.text(x, rect.top, &label, canvas::rgb(20, 16, 26));
 				}
 			}
 		}
@@ -2943,7 +3388,8 @@ impl App {
 			if !self.ime_text.is_empty() {
 				let text = clip_text(&self.ime_text, 40);
 				let width = text.width() as i32 * cw;
-				self.canvas.fill(x, y, x + width, y + ch, canvas::rgb(60, 52, 30));
+				self.canvas
+					.fill(x, y, x + width, y + ch, canvas::rgb(60, 52, 30));
 				self.canvas.text(x, y, &text, canvas::rgb(240, 220, 170));
 			}
 		}
@@ -2957,7 +3403,17 @@ impl App {
 		let cw = self.canvas.cell_w;
 		let ch = self.canvas.cell_h;
 		let y = self.height - ch;
-		self.canvas.fill(0, y, self.width, self.height, canvas::rgb(canvas::STATUS_BG.0, canvas::STATUS_BG.1, canvas::STATUS_BG.2));
+		self.canvas.fill(
+			0,
+			y,
+			self.width,
+			self.height,
+			canvas::rgb(
+				canvas::STATUS_BG.0,
+				canvas::STATUS_BG.1,
+				canvas::STATUS_BG.2,
+			),
+		);
 		let mut x = 0i32;
 		for index in 0..self.tabs.len() {
 			let label = format!(" {} {} ", index + 1, self.tab_title(index));
@@ -2966,19 +3422,40 @@ impl App {
 				break;
 			}
 			if index == self.active {
-				self.canvas.fill(x, y, x + width, y + ch, canvas::rgb(canvas::ACCENT.0, canvas::ACCENT.1, canvas::ACCENT.2));
+				self.canvas.fill(
+					x,
+					y,
+					x + width,
+					y + ch,
+					canvas::rgb(canvas::ACCENT.0, canvas::ACCENT.1, canvas::ACCENT.2),
+				);
 				self.canvas.text(x, y, &label, canvas::rgb(10, 12, 16));
 			} else {
-				self.canvas.text(x, y, &label, canvas::rgb(canvas::STATUS_FG.0, canvas::STATUS_FG.1, canvas::STATUS_FG.2));
+				self.canvas.text(
+					x,
+					y,
+					&label,
+					canvas::rgb(
+						canvas::STATUS_FG.0,
+						canvas::STATUS_FG.1,
+						canvas::STATUS_FG.2,
+					),
+				);
 			}
 			x += width;
 		}
 		let pane = self.focused();
-		// The mode field holds one of five window modes: normal, insert, replace,
-		// agent, share. Agent and share belong to the AI and carry its name.
+		// The mode field holds one of four window modes: normal, insert, agent,
+		// share. Agent and share belong to the AI and carry its name.
 		let owner_mode = pane.and_then(|p| match &p.owner {
-			Owner::Agent(agent) => Some((format!("agent {}", agent_badge(agent)), owner_color(&p.owner))),
-			Owner::Share(agent) => Some((format!("share {}", agent_badge(agent)), owner_color(&p.owner))),
+			Owner::Agent(agent) => Some((
+				format!("agent {}", agent_badge(agent)),
+				owner_color(&p.owner),
+			)),
+			Owner::Share(agent) => Some((
+				format!("share {}", agent_badge(agent)),
+				owner_color(&p.owner),
+			)),
 			Owner::Normal => None,
 		});
 		let (mode_label, mode_color) = match (owner_mode, self.scroll_mode) {
@@ -2988,12 +3465,15 @@ impl App {
 				String::from(match self.mode {
 					Mode::Normal => "NORMAL",
 					Mode::Insert => "INSERT",
-					Mode::Replace => "REPLACE",
 				}),
 				None,
 			),
 		};
-		let zoom = self.tabs.get(self.active).map(|t| t.saved.is_some()).unwrap_or(false);
+		let zoom = self
+			.tabs
+			.get(self.active)
+			.map(|t| t.saved.is_some())
+			.unwrap_or(false);
 		let prefix = format!("{mode_label}  ");
 		let tail = format!(
 			"tab {}/{}  pane {}{} ",
@@ -3015,6 +3495,11 @@ impl App {
 	}
 
 	fn draw_modal(&mut self) {
+		if let Some(Modal::PaneLimit { scroll }) = &self.modal {
+			let scroll = *scroll;
+			self.draw_pane_limit(scroll);
+			return;
+		}
 		let (title, lines) = self.modal_lines();
 		if title.is_empty() && lines.is_empty() {
 			return;
@@ -3034,11 +3519,111 @@ impl App {
 		let box_h = ((wrapped.len() + 3) as i32 * ch).min(self.height - 20);
 		let x = (self.width - box_w) / 2;
 		let y = (self.height - box_h) / 2;
-		self.canvas.fill(x, y, x + box_w, y + box_h, canvas::rgb(20, 22, 30));
-		self.canvas.outline(x, y, x + box_w, y + box_h, canvas::rgb(canvas::BORDER_ACTIVE.0, canvas::BORDER_ACTIVE.1, canvas::BORDER_ACTIVE.2));
-		self.canvas.text(x + cw, y + ch, &clip_text(&title, width), canvas::rgb(canvas::ACCENT.0, canvas::ACCENT.1, canvas::ACCENT.2));
+		self.canvas
+			.fill(x, y, x + box_w, y + box_h, canvas::rgb(20, 22, 30));
+		self.canvas.outline(
+			x,
+			y,
+			x + box_w,
+			y + box_h,
+			canvas::rgb(
+				canvas::BORDER_ACTIVE.0,
+				canvas::BORDER_ACTIVE.1,
+				canvas::BORDER_ACTIVE.2,
+			),
+		);
+		self.canvas.text(
+			x + cw,
+			y + ch,
+			&clip_text(&title, width),
+			canvas::rgb(canvas::ACCENT.0, canvas::ACCENT.1, canvas::ACCENT.2),
+		);
 		for (index, line) in wrapped.iter().enumerate() {
-			self.canvas.text(x + cw, y + (2 + index as i32) * ch, &clip_text(line, width), canvas::rgb(canvas::DEFAULT_FG.0, canvas::DEFAULT_FG.1, canvas::DEFAULT_FG.2));
+			self.canvas.text(
+				x + cw,
+				y + (2 + index as i32) * ch,
+				&clip_text(line, width),
+				canvas::rgb(
+					canvas::DEFAULT_FG.0,
+					canvas::DEFAULT_FG.1,
+					canvas::DEFAULT_FG.2,
+				),
+			);
+		}
+	}
+
+	/// The `p` popup: a fixed-height window list; the wheel moves the list, the
+	/// header rows stay where they are.
+	fn draw_pane_limit(&mut self, scroll: isize) {
+		const FIXED: usize = 3;
+		let (title, lines) = self.modal_lines();
+		let fixed = FIXED.min(lines.len());
+		let list = &lines[fixed..];
+		let start = (scroll.max(0) as usize).min(list.len().saturating_sub(PANE_LIST_ROWS));
+		let cw = self.canvas.cell_w;
+		let ch = self.canvas.cell_h;
+		let mut width = title.width();
+		for line in &lines {
+			width = width.max(line.width());
+		}
+		width = width.min(((self.width / cw) as usize).saturating_sub(6).max(20));
+		let box_w = ((width + 4) as i32 * cw).min(self.width - 20);
+		let box_h = (((3 + fixed + PANE_LIST_ROWS) as i32) * ch).min(self.height - 20);
+		let x = (self.width - box_w) / 2;
+		let y = (self.height - box_h) / 2;
+		self.canvas
+			.fill(x, y, x + box_w, y + box_h, canvas::rgb(20, 22, 30));
+		self.canvas.outline(
+			x,
+			y,
+			x + box_w,
+			y + box_h,
+			canvas::rgb(
+				canvas::BORDER_ACTIVE.0,
+				canvas::BORDER_ACTIVE.1,
+				canvas::BORDER_ACTIVE.2,
+			),
+		);
+		self.canvas.text(
+			x + cw,
+			y + ch,
+			&clip_text(&title, width),
+			canvas::rgb(canvas::ACCENT.0, canvas::ACCENT.1, canvas::ACCENT.2),
+		);
+		let fg = canvas::rgb(
+			canvas::DEFAULT_FG.0,
+			canvas::DEFAULT_FG.1,
+			canvas::DEFAULT_FG.2,
+		);
+		for (index, line) in lines[..fixed].iter().enumerate() {
+			self.canvas.text(
+				x + cw,
+				y + (2 + index as i32) * ch,
+				&clip_text(line, width),
+				fg,
+			);
+		}
+		// Fixed rows even when the list is shorter, so the box does not jump.
+		for row in 0..PANE_LIST_ROWS {
+			let Some(line) = list.get(start + row) else {
+				break;
+			};
+			self.canvas.text(
+				x + cw,
+				y + (2 + fixed + row) as i32 * ch,
+				&clip_text(line, width),
+				fg,
+			);
+		}
+		if list.len() > PANE_LIST_ROWS {
+			let more = format!("{}/{}  滚轮查看", start + 1, list.len());
+			let w = more.width() as i32 * cw;
+			self.canvas.text(
+				x + box_w - w - cw,
+				y + box_h - ch,
+				&more,
+				canvas::rgb(canvas::ACCENT.0, canvas::ACCENT.1, canvas::ACCENT.2),
+			);
 		}
 	}
 }
@@ -3051,13 +3636,21 @@ unsafe fn forward_open(hwnd: HWND, path: &std::path::Path) -> bool {
 		cbData: bytes.len() as u32,
 		lpData: bytes.as_ptr() as *mut _,
 	};
-	SendMessageW(hwnd, WM_COPYDATA, 0, &data as *const COPYDATASTRUCT as isize) != 0
+	SendMessageW(
+		hwnd,
+		WM_COPYDATA,
+		0,
+		&data as *const COPYDATASTRUCT as isize,
+	) != 0
 }
 
 fn default_shell() -> String {
 	std::env::current_exe()
 		.ok()
-		.and_then(|exe| exe.parent().map(|dir| format!("\"{}\"", dir.join("odd.exe").display())))
+		.and_then(|exe| {
+			exe.parent()
+				.map(|dir| format!("\"{}\"", dir.join("odd.exe").display()))
+		})
 		.unwrap_or_else(|| String::from("odd.exe"))
 }
 
@@ -3094,8 +3687,15 @@ fn highest_priority(ids: &[PaneId], prio: &HashMap<PaneId, Priority>) -> Option<
 	ids.iter().copied().max_by_key(|id| priority_key(prio, *id))
 }
 
-fn lowest_priority(ids: &[PaneId], prio: &HashMap<PaneId, Priority>, except: Option<PaneId>) -> Option<PaneId> {
-	ids.iter().copied().filter(|id| Some(*id) != except).min_by_key(|id| priority_key(prio, *id))
+fn lowest_priority(
+	ids: &[PaneId],
+	prio: &HashMap<PaneId, Priority>,
+	except: Option<PaneId>,
+) -> Option<PaneId> {
+	ids.iter()
+		.copied()
+		.filter(|id| Some(*id) != except)
+		.min_by_key(|id| priority_key(prio, *id))
 }
 
 fn owner_label(owner: &Owner) -> String {
@@ -3114,10 +3714,6 @@ fn agent_badge(agent: &str) -> String {
 	}
 }
 
-fn is_modifier(vk: u16) -> bool {
-	matches!(vk, 0x10 | 0x11 | 0x12 | 0x5B | 0x5C | 0xA0..=0xA5)
-}
-
 fn owner_color(owner: &Owner) -> u32 {
 	match owner {
 		Owner::Normal => canvas::rgb(canvas::BORDER.0, canvas::BORDER.1, canvas::BORDER.2),
@@ -3126,16 +3722,12 @@ fn owner_color(owner: &Owner) -> u32 {
 	}
 }
 
-fn editor_col_at(editor: &Editor, row: usize, target_cell: usize) -> usize {
-	let Some(line) = editor.lines.get(row) else { return 0 };
-	let mut cell = 0usize;
-	for (index, ch) in line.iter().enumerate() {
-		if cell >= target_cell {
-			return index;
-		}
-		cell += if *ch == '\t' { 4 - cell % 4 } else { crate::solid::char_cells(*ch) };
+fn pad_text(text: &str, cols: usize) -> String {
+	let width = text.width();
+	if width >= cols {
+		return text.to_string();
 	}
-	line.len()
+	format!("{text}{}", " ".repeat(cols - width))
 }
 
 fn clip_text(text: &str, cols: usize) -> String {
@@ -3165,7 +3757,13 @@ fn wrap_text(text: &str, cols: usize) -> Vec<String> {
 		if width + w > cols {
 			if let Some((index, _)) = last_space {
 				let rest: String = current.chars().skip(index + 1).collect();
-				current.truncate(current.char_indices().nth(index).map(|(i, _)| i).unwrap_or(current.len()));
+				current.truncate(
+					current
+						.char_indices()
+						.nth(index)
+						.map(|(i, _)| i)
+						.unwrap_or(current.len()),
+				);
 				out.push(current.trim_end().to_string());
 				current = rest;
 				width = current.width();
@@ -3223,59 +3821,24 @@ fn char_for_key(vk: u16, scan: u16) -> Option<char> {
 		}
 		let mut buf = [0u16; 8];
 		let layout = GetKeyboardLayout(0);
-		let ret = ToUnicodeEx(vk as u32, scan as u32, state.as_ptr(), buf.as_mut_ptr(), buf.len() as i32, 0, layout);
+		let ret = ToUnicodeEx(
+			vk as u32,
+			scan as u32,
+			state.as_ptr(),
+			buf.as_mut_ptr(),
+			buf.len() as i32,
+			0,
+			layout,
+		);
 		if ret > 0 {
-			char::decode_utf16(buf[..ret as usize].iter().copied()).next().and_then(|r| r.ok())
+			char::decode_utf16(buf[..ret as usize].iter().copied())
+				.next()
+				.and_then(|r| r.ok())
 		} else {
 			None
 		}
 	}
 }
-
-fn clipboard_text() -> Option<String> {
-	for _ in 0..5 {
-		if let Ok(mut clipboard) = arboard::Clipboard::new() {
-			if let Ok(text) = clipboard.get_text() {
-				if !text.is_empty() {
-					return Some(text);
-				}
-			}
-			return None;
-		}
-		std::thread::sleep(Duration::from_millis(10));
-	}
-	None
-}
-
-fn clipboard_image_path() -> Option<String> {
-	for _ in 0..3 {
-		let Ok(mut clipboard) = arboard::Clipboard::new() else { continue };
-		let Ok(image) = clipboard.get_image() else { return None };
-		let stamp = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_millis();
-		let path = std::env::temp_dir().join(format!("delta-paste-{stamp}.png"));
-		let file = std::fs::File::create(&path).ok()?;
-		let mut encoder = png::Encoder::new(file, image.width as u32, image.height as u32);
-		encoder.set_color(png::ColorType::Rgba);
-		encoder.set_depth(png::BitDepth::Eight);
-		let mut writer = encoder.write_header().ok()?;
-		writer.write_image_data(&image.bytes).ok()?;
-		drop(writer);
-		return Some(path.to_string_lossy().into_owned());
-	}
-	None
-}
-
-fn set_clipboard(text: &str) {
-	for _ in 0..5 {
-		if let Ok(mut clipboard) = arboard::Clipboard::new() {
-			if clipboard.set_text(text.to_string()).is_ok() {
-				return;
-			}
-		}
-		std::thread::sleep(Duration::from_millis(10));
-	}
-}
-
 
 #[cfg(test)]
 mod tests {

@@ -67,7 +67,10 @@ impl Default for Cell {
 
 impl Cell {
 	pub fn blank_with(bg: Color) -> Self {
-		Self { bg, ..Self::default() }
+		Self {
+			bg,
+			..Self::default()
+		}
 	}
 
 	pub fn is_blank(&self) -> bool {
@@ -116,7 +119,10 @@ pub struct Row {
 
 impl Row {
 	fn new(cols: usize) -> Self {
-		Self { cells: vec![Cell::default(); cols], wrapped: false }
+		Self {
+			cells: vec![Cell::default(); cols],
+			wrapped: false,
+		}
 	}
 
 	fn trim_end(&mut self) {
@@ -352,11 +358,19 @@ impl Screen {
 	}
 
 	fn grid(&self) -> &Grid {
-		if self.active_alt { &self.alt } else { &self.primary }
+		if self.active_alt {
+			&self.alt
+		} else {
+			&self.primary
+		}
 	}
 
 	fn grid_mut(&mut self) -> &mut Grid {
-		if self.active_alt { &mut self.alt } else { &mut self.primary }
+		if self.active_alt {
+			&mut self.alt
+		} else {
+			&mut self.primary
+		}
 	}
 
 	pub fn is_alt(&self) -> bool {
@@ -481,7 +495,11 @@ impl Screen {
 		for r in sr..=er {
 			let Some(row) = self.row_abs(r) else { continue };
 			let from = if r == sr { sc.min(row.cells.len()) } else { 0 };
-			let to = if r == er { (ec + 1).min(row.cells.len()) } else { row.cells.len() };
+			let to = if r == er {
+				(ec + 1).min(row.cells.len())
+			} else {
+				row.cells.len()
+			};
 			for c in &row.cells[from..to] {
 				if c.wide == 2 {
 					continue;
@@ -529,7 +547,10 @@ impl Screen {
 			Action::Print(c) => self.print(c),
 			Action::Execute(b) => self.execute(b),
 			Action::Csi(c) => self.csi(c),
-			Action::Esc { intermediates, final_byte } => self.esc(&intermediates, final_byte),
+			Action::Esc {
+				intermediates,
+				final_byte,
+			} => self.esc(&intermediates, final_byte),
 			Action::Osc(data) => self.osc(&data),
 			Action::DcsHook(_) | Action::DcsPut(_) | Action::DcsUnhook => {}
 			Action::ApcStart | Action::ApcPut(_) | Action::ApcEnd => {}
@@ -797,7 +818,11 @@ impl Screen {
 		let cols = self.cols;
 		let rows_len = self.rows;
 		for _ in 0..n.min(rows_len.max(1)) {
-			let mut restored = if full && primary { self.scrollback.pop_back() } else { None };
+			let mut restored = if full && primary {
+				self.scrollback.pop_back()
+			} else {
+				None
+			};
 			if let Some(r) = &mut restored {
 				r.cells.resize(cols, Cell::default());
 			}
@@ -818,7 +843,10 @@ impl Screen {
 			let bg = self.pen.bg;
 			let cols = self.cols;
 			let g = self.grid_mut();
-			g.rows[y] = Row { cells: vec![Cell::blank_with(bg); cols], wrapped: false };
+			g.rows[y] = Row {
+				cells: vec![Cell::blank_with(bg); cols],
+				wrapped: false,
+			};
 		}
 	}
 
@@ -852,7 +880,10 @@ impl Screen {
 		let bg = self.pen.bg;
 		let g = self.grid_mut();
 		for row in &mut g.rows {
-			*row = Row { cells: vec![Cell::blank_with(bg); cols], wrapped: false };
+			*row = Row {
+				cells: vec![Cell::blank_with(bg); cols],
+				wrapped: false,
+			};
 		}
 		g.rows.resize_with(rows, || Row::new(cols));
 		g.cursor_x = 0;
@@ -957,7 +988,8 @@ impl Screen {
 			b'H' | b'f' => {
 				let row = c.param(0, 1) as usize;
 				let col = c.param(1, 1) as usize;
-				let (top, bottom, origin) = (self.grid().top, self.grid().bottom, self.modes.origin);
+				let (top, bottom, origin) =
+					(self.grid().top, self.grid().bottom, self.modes.origin);
 				let cols = self.cols;
 				let rows = self.rows;
 				let g = self.grid_mut();
@@ -1110,7 +1142,8 @@ impl Screen {
 			}
 			b'd' => {
 				let n = c.param(0, 1) as usize;
-				let (top, origin, bottom) = (self.grid().top, self.modes.origin, self.grid().bottom);
+				let (top, origin, bottom) =
+					(self.grid().top, self.modes.origin, self.grid().bottom);
 				let rows = self.rows;
 				let g = self.grid_mut();
 				g.cursor_y = if origin {
@@ -1288,13 +1321,43 @@ impl Screen {
 			7 => self.modes.autowrap = set,
 			12 => self.modes.cursor_blink = set,
 			25 => self.modes.cursor_visible = set,
-			1000 => self.modes.mouse_mode = if set { MouseMode::Normal } else { MouseMode::None },
-			1002 => self.modes.mouse_mode = if set { MouseMode::Button } else { MouseMode::None },
+			1000 => {
+				self.modes.mouse_mode = if set {
+					MouseMode::Normal
+				} else {
+					MouseMode::None
+				}
+			}
+			1002 => {
+				self.modes.mouse_mode = if set {
+					MouseMode::Button
+				} else {
+					MouseMode::None
+				}
+			}
 			1003 => self.modes.mouse_mode = if set { MouseMode::Any } else { MouseMode::None },
 			1004 => self.modes.focus_events = set,
-			1005 => self.modes.mouse_encoding = if set { MouseEncoding::Utf8 } else { MouseEncoding::X10 },
-			1006 => self.modes.mouse_encoding = if set { MouseEncoding::Sgr } else { MouseEncoding::X10 },
-			1015 => self.modes.mouse_encoding = if set { MouseEncoding::Urxvt } else { MouseEncoding::X10 },
+			1005 => {
+				self.modes.mouse_encoding = if set {
+					MouseEncoding::Utf8
+				} else {
+					MouseEncoding::X10
+				}
+			}
+			1006 => {
+				self.modes.mouse_encoding = if set {
+					MouseEncoding::Sgr
+				} else {
+					MouseEncoding::X10
+				}
+			}
+			1015 => {
+				self.modes.mouse_encoding = if set {
+					MouseEncoding::Urxvt
+				} else {
+					MouseEncoding::X10
+				}
+			}
 			1047 => {
 				if set {
 					self.enter_alt(false, true);
@@ -1370,7 +1433,9 @@ impl Screen {
 	}
 
 	fn restore_cursor(&mut self) {
-		let Some(s) = self.grid().saved.clone() else { return };
+		let Some(s) = self.grid().saved.clone() else {
+			return;
+		};
 		let cols = self.cols;
 		let rows = self.rows;
 		let g = self.grid_mut();
@@ -1467,15 +1532,27 @@ impl Screen {
 			let mut sub = Vec::new();
 			while j < params.len() {
 				sub.push(params[j]);
-				let more = if colon { c.colon_after(j) } else { j + 1 < params.len() && !c.colon_after(j) };
+				let more = if colon {
+					c.colon_after(j)
+				} else {
+					j + 1 < params.len() && !c.colon_after(j)
+				};
 				j += 1;
 				if !more {
 					break;
 				}
 			}
-			let rgb = if sub.len() >= 4 { &sub[sub.len() - 3..] } else { &sub[..] };
+			let rgb = if sub.len() >= 4 {
+				&sub[sub.len() - 3..]
+			} else {
+				&sub[..]
+			};
 			if rgb.len() >= 3 {
-				Color::Rgb(rgb[0].min(255) as u8, rgb[1].min(255) as u8, rgb[2].min(255) as u8)
+				Color::Rgb(
+					rgb[0].min(255) as u8,
+					rgb[1].min(255) as u8,
+					rgb[2].min(255) as u8,
+				)
 			} else {
 				return j.saturating_sub(1);
 			}
@@ -1541,7 +1618,12 @@ impl Screen {
 				let g = self.grid_mut();
 				for row in &mut g.rows {
 					for cell in row.cells.iter_mut() {
-						*cell = Cell { ch: 'E', fg: pen.fg, bg: pen.bg, ..Cell::default() };
+						*cell = Cell {
+							ch: 'E',
+							fg: pen.fg,
+							bg: pen.bg,
+							..Cell::default()
+						};
 					}
 				}
 				g.cursor_x = 0;
@@ -1557,7 +1639,9 @@ impl Screen {
 			Some(pos) => (&data[..pos], &data[pos + 1..]),
 			None => (data, &[][..]),
 		};
-		let Ok(cmd) = std::str::from_utf8(cmd) else { return };
+		let Ok(cmd) = std::str::from_utf8(cmd) else {
+			return;
+		};
 		match cmd {
 			"0" | "2" => {
 				self.title = String::from_utf8_lossy(rest).to_string();
@@ -1585,7 +1669,14 @@ impl Screen {
 				let mut parts = s.split(';');
 				match parts.next() {
 					Some("C") => self.command_finished = None,
-					Some("D") => self.command_finished = Some(parts.next().and_then(|status| status.parse().ok()).unwrap_or(0)),
+					Some("D") => {
+						self.command_finished = Some(
+							parts
+								.next()
+								.and_then(|status| status.parse().ok())
+								.unwrap_or(0),
+						)
+					}
 					_ => {}
 				}
 			}
@@ -1778,7 +1869,10 @@ impl Screen {
 				while cells.len() < cols {
 					cells.push(Cell::default());
 				}
-				out.push(Row { cells, wrapped: more });
+				out.push(Row {
+					cells,
+					wrapped: more,
+				});
 				if !more {
 					break;
 				}
@@ -1827,7 +1921,11 @@ impl Screen {
 		let old = std::mem::take(&mut self.tabs);
 		let mut tabs = vec![false; cols];
 		for (i, t) in tabs.iter_mut().enumerate() {
-			*t = if i < old_cols { old.get(i).copied().unwrap_or(false) } else { i % 8 == 0 };
+			*t = if i < old_cols {
+				old.get(i).copied().unwrap_or(false)
+			} else {
+				i % 8 == 0
+			};
 		}
 		self.tabs = tabs;
 	}

@@ -244,12 +244,12 @@ impl Client {
 	}
 
 	pub fn prompt(&self, session: &str, text: &str) -> Result<(), String> {
-		let body = json!({"text": text, "delivery": "steer"}).to_string();
+		let body = json!({"text": text, "delivery": "steer"});
 		self.request(
 			"POST",
 			&["api", "session", session, "prompt"],
 			&[],
-			Some(&body),
+			Some(&body.to_string()),
 		)?;
 		Ok(())
 	}

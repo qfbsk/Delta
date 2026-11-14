@@ -4,13 +4,13 @@
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(12 * 60 * 60);
 const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -48,7 +48,10 @@ pub fn start() -> std::io::Result<McpServer> {
 			thread::spawn(move || handle_connection(stream, tx));
 		}
 	});
-	Ok(McpServer { url: format!("http://127.0.0.1:{port}/mcp"), rx })
+	Ok(McpServer {
+		url: format!("http://127.0.0.1:{port}/mcp"),
+		rx,
+	})
 }
 
 fn handle_connection(mut stream: TcpStream, tx: Sender<McpRequest>) {
@@ -82,7 +85,9 @@ fn handle_connection(mut stream: TcpStream, tx: Sender<McpRequest>) {
 	let mut content_length = 0usize;
 	let mut agent = String::from("ai");
 	for line in lines {
-		let Some((name, value)) = line.split_once(':') else { continue };
+		let Some((name, value)) = line.split_once(':') else {
+			continue;
+		};
 		match name.to_ascii_lowercase().as_str() {
 			"content-length" => content_length = value.trim().parse().unwrap_or(0),
 			"x-delta-agent" => agent = value.trim().to_string(),
@@ -106,8 +111,12 @@ fn handle_connection(mut stream: TcpStream, tx: Sender<McpRequest>) {
 		Ok(value) => value,
 		Err(err) => {
 			let reply = json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": err.to_string()}});
-			let _ = respond(&mut stream, 200, "application/json",
-				&serde_json::to_string(&reply).unwrap_or_default());
+			let _ = respond(
+				&mut stream,
+				200,
+				"application/json",
+				&serde_json::to_string(&reply).unwrap_or_default(),
+			);
 			return;
 		}
 	};
@@ -138,13 +147,23 @@ fn handle_connection(mut stream: TcpStream, tx: Sender<McpRequest>) {
 			let name = request["params"]["name"].as_str().unwrap_or("").to_string();
 			let args = request["params"]["arguments"].clone();
 			let (reply_tx, reply_rx) = mpsc::channel();
-			let session = request["params"]["_meta"]["ai.opencode/sessionID"].as_str().map(String::from);
+			let session = request["params"]["_meta"]["ai.opencode/sessionID"]
+				.as_str()
+				.map(String::from);
 			let expires = Instant::now() + REQUEST_TIMEOUT;
 			let cancelled = Arc::new(AtomicBool::new(false));
-			if tx.send(McpRequest {
-				tool: name.clone(), args, agent: agent.clone(), session, expires,
-				cancelled: Arc::clone(&cancelled), reply: reply_tx,
-			}).is_err() {
+			if tx
+				.send(McpRequest {
+					tool: name.clone(),
+					args,
+					agent: agent.clone(),
+					session,
+					expires,
+					cancelled: Arc::clone(&cancelled),
+					reply: reply_tx,
+				})
+				.is_err()
+			{
 				cancelled.store(true, Ordering::Release);
 				json!({"jsonrpc": "2.0", "id": id, "result": {
 					"content": [{"type": "text", "text": "Delta is not running (channel closed)."}],
@@ -153,7 +172,10 @@ fn handle_connection(mut stream: TcpStream, tx: Sender<McpRequest>) {
 			} else {
 				match wait_for_reply(&stream, &reply_rx, expires, &cancelled) {
 					Ok(Ok(value)) => {
-						let text = value["text"].as_str().map(String::from).unwrap_or_else(|| value.to_string());
+						let text = value["text"]
+							.as_str()
+							.map(String::from)
+							.unwrap_or_else(|| value.to_string());
 						let is_error = value["error"].as_bool().unwrap_or(false);
 						json!({"jsonrpc": "2.0", "id": id, "result": {
 							"content": [{"type": "text", "text": text}],
@@ -171,7 +193,9 @@ fn handle_connection(mut stream: TcpStream, tx: Sender<McpRequest>) {
 				}
 			}
 		}
-		other => json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": format!("unknown method {other}")}}),
+		other => {
+			json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": format!("unknown method {other}")}})
+		}
 	};
 	let text = serde_json::to_string(&response).unwrap_or_default();
 	let _ = respond(&mut stream, 200, "application/json", &text);
@@ -184,15 +208,21 @@ fn wait_for_reply(
 	cancelled: &AtomicBool,
 ) -> Result<Result<Value, String>, &'static str> {
 	let result = (|| {
-		stream.set_nonblocking(true).map_err(|_| "Delta cannot monitor the connection.")?;
+		stream
+			.set_nonblocking(true)
+			.map_err(|_| "Delta cannot monitor the connection.")?;
 		let mut answer = None;
 		loop {
 			if cancelled.load(Ordering::Acquire) {
-				return Err("Delta request cancelled; commands already started are not rolled back.");
+				return Err(
+					"Delta request cancelled; commands already started are not rolled back.",
+				);
 			}
 			let remaining = expires.saturating_duration_since(Instant::now());
 			if remaining.is_zero() {
-				return Err("Delta request timed out; commands not yet started are cancelled. Commands already started are not rolled back.");
+				return Err(
+					"Delta request timed out; commands not yet started are cancelled. Commands already started are not rolled back.",
+				);
 			}
 			// Nonblocking peek detects FIN (including a write half-close) or reset
 			// without spending the HTTP read timeout on an otherwise idle client.
@@ -201,7 +231,8 @@ fn wait_for_reply(
 				// One HTTP request per connection. Do not leave extra bytes queued:
 				// they would hide a subsequent FIN from every later peek.
 				Ok(_) => return Err("Delta accepts only one request per connection."),
-				Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {}
+				Err(err)
+					if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {}
 				Err(_) => return Err("Delta connection failed."),
 			}
 			// Recheck cancellation, deadline and socket after receiving a reply,
@@ -228,7 +259,12 @@ fn wait_for_reply(
 	result
 }
 
-fn respond(stream: &mut TcpStream, status: u16, content_type: &str, body: &str) -> std::io::Result<()> {
+fn respond(
+	stream: &mut TcpStream,
+	status: u16,
+	content_type: &str,
+	body: &str,
+) -> std::io::Result<()> {
 	let reason = match status {
 		200 => "OK",
 		202 => "Accepted",
@@ -329,11 +365,15 @@ mod tests {
 				"name": "run_in_terminal", "arguments": {"id": 1, "command": "pwd"},
 				"_meta": {"ai.opencode/sessionID": "session-1"}
 			}
-		}).to_string();
-		write!(client,
+		})
+		.to_string();
+		write!(
+			client,
 			"POST /mcp HTTP/1.1\r\nHost: localhost\r\nX-Delta-Agent: sam\r\nContent-Length: {}\r\n\r\n{}",
-			body.len(), body,
-		).unwrap();
+			body.len(),
+			body,
+		)
+		.unwrap();
 		let request = rx.recv_timeout(TEST_TIMEOUT).unwrap();
 		(client, request, done_rx)
 	}
@@ -357,7 +397,10 @@ mod tests {
 		assert!(!request.is_active());
 		assert!(request.reply.send(Ok(json!({"text": "too late"}))).is_err());
 		assert!(other.is_active());
-		other.reply.send(Ok(json!({"text": "still active"}))).unwrap();
+		other
+			.reply
+			.send(Ok(json!({"text": "still active"})))
+			.unwrap();
 		let response = read_response(&mut other_client, other_done);
 		assert_eq!(response["result"]["content"][0]["text"], "still active");
 		assert!(!other.cancelled.load(Ordering::Acquire));
@@ -375,10 +418,13 @@ mod tests {
 		assert_eq!(request.agent, "sam");
 		assert_eq!(request.session.as_deref(), Some("session-1"));
 		request.reply.send(Ok(json!({"text": "正常回复"}))).unwrap();
-		assert_eq!(read_response(&mut client, done), json!({
-			"jsonrpc": "2.0", "id": 7,
-			"result": {"content": [{"type": "text", "text": "正常回复"}], "isError": false}
-		}));
+		assert_eq!(
+			read_response(&mut client, done),
+			json!({
+				"jsonrpc": "2.0", "id": 7,
+				"result": {"content": [{"type": "text", "text": "正常回复"}], "isError": false}
+			})
+		);
 		assert!(!request.cancelled.load(Ordering::Acquire));
 	}
 
@@ -389,7 +435,12 @@ mod tests {
 		let response = read_response(&mut client, done);
 		assert!(!request.is_active());
 		assert_eq!(response["result"]["isError"], true);
-		assert!(response["result"]["content"][0]["text"].as_str().unwrap().contains("cancelled"));
+		assert!(
+			response["result"]["content"][0]["text"]
+				.as_str()
+				.unwrap()
+				.contains("cancelled")
+		);
 		assert!(request.reply.send(Ok(json!({}))).is_err());
 	}
 
@@ -430,9 +481,13 @@ mod tests {
 	fn active_requires_both_deadline_and_no_cancellation() {
 		let (reply, _rx) = mpsc::channel();
 		let mut request = McpRequest {
-			tool: "list_windows".to_string(), args: json!({}), agent: "sam".to_string(),
-			session: None, expires: Instant::now() + TEST_TIMEOUT,
-			cancelled: Arc::new(AtomicBool::new(false)), reply,
+			tool: "list_windows".to_string(),
+			args: json!({}),
+			agent: "sam".to_string(),
+			session: None,
+			expires: Instant::now() + TEST_TIMEOUT,
+			cancelled: Arc::new(AtomicBool::new(false)),
+			reply,
 		};
 		assert!(request.is_active());
 		request.cancelled.store(true, Ordering::Release);

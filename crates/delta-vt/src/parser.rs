@@ -68,7 +68,10 @@ pub enum Action {
 	Print(char),
 	Execute(u8),
 	Csi(Csi),
-	Esc { intermediates: Vec<u8>, final_byte: u8 },
+	Esc {
+		intermediates: Vec<u8>,
+		final_byte: u8,
+	},
 	Osc(Vec<u8>),
 	DcsHook(Dcs),
 	DcsPut(u8),
@@ -211,7 +214,10 @@ impl Parser {
 			self.param_acc = 0;
 			self.param_started = false;
 		} else {
-			self.param_acc = self.param_acc.saturating_mul(10).saturating_add((c - b'0') as u32);
+			self.param_acc = self
+				.param_acc
+				.saturating_mul(10)
+				.saturating_add((c - b'0') as u32);
 			self.param_started = true;
 		}
 	}
@@ -231,7 +237,10 @@ impl Parser {
 	}
 
 	fn param_vec(&self) -> (Vec<u16>, Vec<bool>) {
-		(self.params[..self.n_params].to_vec(), self.seps[..self.n_params].to_vec())
+		(
+			self.params[..self.n_params].to_vec(),
+			self.seps[..self.n_params].to_vec(),
+		)
 	}
 
 	fn next_state(&self, c: u8) -> State {
@@ -453,7 +462,10 @@ impl Parser {
 			}
 			Transition::EscDispatch => {
 				self.finish_params();
-				Some(Action::Esc { intermediates: self.inter_vec(), final_byte: c })
+				Some(Action::Esc {
+					intermediates: self.inter_vec(),
+					final_byte: c,
+				})
 			}
 			Transition::CsiDispatch => {
 				self.finish_params();
@@ -544,7 +556,10 @@ mod tests {
 		let mut p = Parser::new();
 		let a = actions(&mut p, b"\x1b(B");
 		match &a[0] {
-			Action::Esc { intermediates, final_byte } => {
+			Action::Esc {
+				intermediates,
+				final_byte,
+			} => {
 				assert_eq!(final_byte, &b'B');
 				assert_eq!(intermediates, &vec![b'(']);
 			}
