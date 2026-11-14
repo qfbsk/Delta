@@ -1019,6 +1019,8 @@ pub fn reader_init(will_restore_foreground_pgroup: bool) {
     assert_is_main_thread();
     #[cfg(windows)]
     fish_common::os::console_input_utf8();
+    #[cfg(windows)]
+    fish_common::os::console_output_utf8();
     let terminal_mode_on_startup = match tcgetattr(STDIN_FD) {
         Ok(modes) => {
             // Save the initial terminal mode.
@@ -1079,6 +1081,8 @@ pub fn restore_term_mode() {
     }
     #[cfg(windows)]
     fish_common::os::console_input_restore();
+    #[cfg(windows)]
+    fish_common::os::console_output_restore();
 }
 
 /// Change the history file for the current command reading context.
@@ -4870,6 +4874,8 @@ pub fn term_copy_modes() {
 pub fn set_shell_modes(fd: RawFd, whence: &str) -> bool {
     #[cfg(windows)]
     fish_common::os::console_input_utf8();
+    #[cfg(windows)]
+    fish_common::os::console_output_utf8();
     loop {
         match tcsetattr(
             unsafe { BorrowedFd::borrow_raw(fd) },

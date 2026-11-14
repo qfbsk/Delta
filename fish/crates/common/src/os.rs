@@ -168,7 +168,9 @@ mod windows_impl {
 
     use super::{RawFd, STDIN_FILENO};
     use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_PIPE, GetFileType};
-    use windows_sys::Win32::System::Console::{GetConsoleCP, SetConsoleCP};
+    use windows_sys::Win32::System::Console::{
+        GetConsoleCP, GetConsoleOutputCP, SetConsoleCP, SetConsoleOutputCP,
+    };
     use windows_sys::Win32::System::Pipes::PeekNamedPipe;
 
     const O_BINARY: i32 = 0x8000;
@@ -366,6 +368,9 @@ mod windows_impl {
     /// The console input code page inherited at startup, restored when a child owns the console.
     static CONSOLE_CODEPAGE: Mutex<Option<u32>> = Mutex::new(None);
 
+    /// The console output code page inherited at startup, restored when fish exits.
+    static CONSOLE_OUTPUT_CODEPAGE: Mutex<Option<u32>> = Mutex::new(None);
+
     /// Make console input UTF-8, the encoding of fish's input stream.
     ///
     /// The inherited code page is the system ANSI one, so conhost would otherwise convert console
@@ -386,6 +391,30 @@ mod windows_impl {
     pub fn console_input_restore() {
         if let Some(cp) = *CONSOLE_CODEPAGE.lock().unwrap_or_else(|e| e.into_inner()) {
             unsafe { SetConsoleCP(cp) };
+        }
+    }
+
+    /// Make console output UTF-8, as termwiz's WindowsTerminal does for its own console.
+    ///
+    /// fish and its children write UTF-8 bytes; under the inherited ANSI code page conhost would
+    /// decode them as GBK and the text would reach the terminal garbled. Unlike input, this is
+    /// not restored before running a child: a child writing UTF-8 (opencode, python) needs the
+    /// console to stay UTF-8. It is restored only when fish exits.
+    pub fn console_output_utf8() {
+        if !is_tty(STDIN_FILENO) {
+            return;
+        }
+        let mut saved = CONSOLE_OUTPUT_CODEPAGE.lock().unwrap_or_else(|e| e.into_inner());
+        if saved.is_none() {
+            *saved = Some(unsafe { GetConsoleOutputCP() });
+        }
+        unsafe { SetConsoleOutputCP(65001) };
+    }
+
+    /// Put back the output code page the console had before fish changed it.
+    pub fn console_output_restore() {
+        if let Some(cp) = *CONSOLE_OUTPUT_CODEPAGE.lock().unwrap_or_else(|e| e.into_inner()) {
+            unsafe { SetConsoleOutputCP(cp) };
         }
     }
 

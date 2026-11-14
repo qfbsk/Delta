@@ -46,7 +46,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use crate::canvas::{self, Canvas};
 use crate::even::{EvenEvent, GroupPane};
 use crate::input::{self, Key};
-use crate::layout::{Dir, Layout, PaneId, Rect};
+use crate::layout::{Dir, Layout, LayoutType, PaneId, Rect};
 use crate::mcp::{self, McpServer};
 use crate::opencode::Client;
 use crate::solid::Editor;
@@ -106,9 +106,23 @@ struct Pane {
 
 struct Tab {
 	layout: Layout,
+	/// The layout a zoom replaced, as in tmux window_zoom; zoom is on while
+	/// this holds the tiled layout.
+	saved: Option<Layout>,
 	panes: HashMap<PaneId, Pane>,
 	focus: PaneId,
-	zoom: bool,
+	/// Windows that live in this tab but are not in its layout, so they keep
+	/// running without being drawn. Only a close (or a raised limit) brings
+	/// one back; see `Priority` for the order.
+	hidden: Vec<PaneId>,
+}
+
+/// When a window was last switched to. The human's switch time comes first;
+/// equal times fall back to the AI's, then to the window number.
+#[derive(Clone, Copy, Default, Debug)]
+struct Priority {
+	human: u64,
+	ai: u64,
 }
 
 enum Modal {
@@ -117,6 +131,7 @@ enum Modal {
 	Takeover { pane: PaneId, agent: String },
 	Tabs,
 	CloseAgent { pane: PaneId, agent: String },
+	PaneLimit,
 	Notice(String),
 }
 
@@ -147,6 +162,10 @@ pub struct App {
 	pending_takeovers: Vec<mcp::McpRequest>,
 	child_env: Vec<(String, String)>,
 	shell: String,
+	/// How many windows a tab draws at once; set through the `p` popup.
+	pane_limit: usize,
+	clock: u64,
+	prio: HashMap<PaneId, Priority>,
 	drag: Option<Drag>,
 	key_chars: HashMap<u16, char>,
 	ime_text: String,
@@ -295,6 +314,9 @@ impl App {
 			pending_takeovers: Vec::new(),
 			child_env,
 			shell,
+			pane_limit: 4,
+			clock: 0,
+			prio: HashMap::new(),
 			drag: None,
 			key_chars: HashMap::new(),
 			ime_text: String::new(),
@@ -497,13 +519,16 @@ impl App {
 		Rect::new(0, 0, self.width, (self.height - self.canvas.cell_h).max(1))
 	}
 
+	/// The tiled area in terminal cells, which is what layout geometry counts.
+	fn content_cells(&self) -> (u32, u32) {
+		let area = self.content_area();
+		let cw = self.canvas.cell_w.max(1);
+		let ch = self.canvas.cell_h.max(1);
+		((area.width() / cw).max(1) as u32, (area.height() / ch).max(1) as u32)
+	}
+
 	fn rects_of(&self, tab: &Tab, area: Rect) -> Vec<(PaneId, Rect)> {
-		if tab.zoom {
-			return vec![(tab.focus, area)];
-		}
-		let mut out = Vec::new();
-		tab.layout.rects(area, 1, &mut out);
-		out
+		tab.layout.rects(area, self.canvas.cell_w.max(1), self.canvas.cell_h.max(1))
 	}
 
 	fn pane(&self, id: PaneId) -> Option<&Pane> {
@@ -582,17 +607,13 @@ impl App {
 		let area = self.content_area();
 		let cw = self.canvas.cell_w.max(1);
 		let ch = self.canvas.cell_h.max(1);
+		let (cols, rows) = self.content_cells();
 		for tab in &mut self.tabs {
-			if tab.zoom {
-				let focus = tab.focus;
-				if let Some(pane) = tab.panes.get_mut(&focus) {
-					resize_body(&mut pane.body, &area, cw, ch);
-				}
-				continue;
+			tab.layout.resize(cols, rows);
+			if let Some(saved) = &mut tab.saved {
+				saved.resize(cols, rows);
 			}
-			let mut rects = Vec::new();
-			tab.layout.rects(area, 1, &mut rects);
-			for (id, rect) in rects {
+			for (id, rect) in tab.layout.rects(area, cw, ch) {
 				if let Some(pane) = tab.panes.get_mut(&id) {
 					resize_body(&mut pane.body, &rect, cw, ch);
 				}
@@ -619,14 +640,7 @@ impl App {
 		let command = self.shell.clone();
 		let envs = self.child_env.clone();
 		let Some((id, term)) = self.spawn_term(&command, &envs) else { return };
-		let mut panes = HashMap::new();
-		panes.insert(id, Pane { id, body: Body::Term(term), owner: Owner::Normal, seen: false, ai_created: false, creator: None, title: None, group_id: 0, member: None });
-		self.tabs.push(Tab { layout: Layout::leaf(id), panes, focus: id, zoom: false });
-		self.active = self.tabs.len() - 1;
-		self.resize_panes();
-		// A fresh tab is focused, so keystrokes belong to it. A window command
-		// sequence is not what someone wants right after asking for a new shell.
-		self.mode = Mode::Insert;
+		self.add_tab(id, Body::Term(term), Owner::Normal, false, 0, None, true);
 	}
 
 	fn add_terminal(
@@ -641,13 +655,14 @@ impl App {
 	) -> Option<PaneId> {
 		let envs = self.child_env.clone();
 		let (id, term) = self.spawn_term(command, &envs)?;
-		self.insert_pane(tab, id, Body::Term(term), owner, ai_created, group, member, focus_new, None);
+		self.add_pane(tab, id, Body::Term(term), owner, ai_created, group, member, focus_new);
 		Some(id)
 	}
 
-	fn insert_pane(
+	/// A new tmux window with its own tab. Only `c` and `!` make tabs; a
+	/// window opened by a program goes into the tab that asked for it.
+	fn add_tab(
 		&mut self,
-		tab_idx: usize,
 		id: PaneId,
 		body: Body,
 		owner: Owner,
@@ -655,53 +670,91 @@ impl App {
 		group: u64,
 		member: Option<String>,
 		focus_new: bool,
-		dir_override: Option<Dir>,
 	) {
-		let area = self.content_area();
-		let cw = self.canvas.cell_w.max(1);
-		let ch = self.canvas.cell_h.max(1);
-		let (target, rect) = match self.tabs.get(tab_idx) {
-			Some(tab) => {
-				let mut rects = Vec::new();
-				tab.layout.rects(area, 1, &mut rects);
-				let rect = rects.iter().find(|(p, _)| *p == tab.focus).map(|(_, r)| *r).unwrap_or(area);
-				(tab.focus, rect)
-			}
-			None => (0, area),
-		};
+		let (cols, rows) = self.content_cells();
 		let pane = Pane { id, body, owner, seen: false, ai_created, creator: None, title: None, group_id: group, member };
-		let dir = dir_override.or_else(|| {
-			if self.tabs.get(tab_idx).is_some() {
-				if rect.width() >= 40 * cw {
-					Some(Dir::Right)
-				} else if rect.height() >= 12 * ch {
-					Some(Dir::Down)
-				} else {
-					None
-				}
-			} else {
-				None
-			}
-		});
-		if let Some(dir) = dir {
-			if let Some(tab) = self.tabs.get_mut(tab_idx) {
-				tab.layout.split(target, id, dir, 0.5);
-				tab.panes.insert(id, pane);
-				if focus_new {
-					tab.focus = id;
-				}
-			}
-		} else {
+		let mut panes = HashMap::new();
+		panes.insert(id, pane);
+		self.tabs.push(Tab { layout: Layout::new(id, cols, rows), saved: None, panes, focus: id, hidden: Vec::new() });
+		if focus_new {
+			self.active = self.tabs.len() - 1;
+			// The window was created in order to be used; typing goes into it.
+			self.mode = Mode::Insert;
+			self.note_human(id);
+		} else if ai_created {
+			self.note_ai(id);
+		}
+		self.resize_panes();
+	}
+
+	/// Puts a program's new window into an existing tab as a pane and lays the
+	/// drawn windows out with `layout_set_tiled`. A tab already drawing its
+	/// limit hides its oldest window so the new one can be drawn; the hidden
+	/// window keeps running. A window too small for one more tiled cell gets a
+	/// new tab instead.
+	fn add_pane(
+		&mut self,
+		tab_index: usize,
+		id: PaneId,
+		body: Body,
+		owner: Owner,
+		ai_created: bool,
+		group: u64,
+		member: Option<String>,
+		focus_new: bool,
+	) {
+		let (cols, rows) = self.content_cells();
+		let pane = Pane { id, body, owner, seen: false, ai_created, creator: None, title: None, group_id: group, member };
+		let Some(tab) = self.tabs.get(tab_index) else { return };
+		let mut drawn = Self::drawn_ids(tab);
+		let fits = Layout::tiled_fits(drawn.len() + 1, cols, rows);
+		if !fits {
 			let mut panes = HashMap::new();
 			panes.insert(id, pane);
-			self.tabs.push(Tab { layout: Layout::leaf(id), panes, focus: id, zoom: false });
+			self.tabs.push(Tab { layout: Layout::new(id, cols, rows), saved: None, panes, focus: id, hidden: Vec::new() });
 			if focus_new {
 				self.active = self.tabs.len() - 1;
 			}
+			if focus_new {
+				self.note_human(id);
+			} else if ai_created {
+				self.note_ai(id);
+			}
+			self.resize_panes();
+			if focus_new {
+				self.mode = Mode::Insert;
+			}
+			return;
+		}
+		if drawn.len() >= self.pane_limit {
+			let focus = self.tabs[tab_index].focus;
+			if let Some(victim) =
+				lowest_priority(&drawn, &self.prio, Some(focus)).or_else(|| lowest_priority(&drawn, &self.prio, None))
+			{
+				drawn.retain(|pane| *pane != victim);
+				let Some(tab) = self.tabs.get_mut(tab_index) else { return };
+				if !tab.hidden.contains(&victim) {
+					tab.hidden.push(victim);
+				}
+				if tab.focus == victim {
+					tab.focus = drawn.first().copied().unwrap_or(id);
+				}
+			}
+		}
+		drawn.push(id);
+		self.retile_ids(tab_index, drawn);
+		let Some(tab) = self.tabs.get_mut(tab_index) else { return };
+		tab.panes.insert(id, pane);
+		if focus_new {
+			tab.focus = id;
+		}
+		if focus_new {
+			self.note_human(id);
+		} else if ai_created {
+			self.note_ai(id);
 		}
 		self.resize_panes();
 		if focus_new {
-			// The pane was created in order to be used; typing goes into it.
 			self.mode = Mode::Insert;
 		}
 	}
@@ -745,7 +798,7 @@ impl App {
 		let id = self.next_pane;
 		self.next_pane += 1;
 		let tab = self.active;
-		self.insert_pane(tab, id, Body::Solid(editor), Owner::Normal, false, 0, None, true, None);
+		self.add_pane(tab, id, Body::Solid(editor), Owner::Normal, false, 0, None, true);
 		Some(id)
 	}
 
@@ -771,6 +824,9 @@ impl App {
 					self.active = index;
 				}
 				self.focus_pane(id);
+				if self.focused_id() == Some(id) {
+					self.note_human(id);
+				}
 				return;
 			}
 		}
@@ -785,7 +841,7 @@ impl App {
 		let id = self.next_pane;
 		self.next_pane += 1;
 		let tab = self.active;
-		self.insert_pane(tab, id, Body::Even(Box::new(group)), Owner::Normal, false, group_id, None, true, None);
+		self.add_pane(tab, id, Body::Even(Box::new(group)), Owner::Normal, false, group_id, None, true);
 		id
 	}
 
@@ -820,6 +876,11 @@ impl App {
 		if let Some(index) = self.tab_index_of(id) {
 			self.active = index;
 			if let Some(tab) = self.tabs.get_mut(index) {
+				// A hidden window has no rectangle; the keyboard cannot land on
+				// something that is not drawn.
+				if !tab.layout.leaves().contains(&id) {
+					return;
+				}
 				tab.focus = id;
 			}
 			self.mark_seen();
@@ -830,51 +891,217 @@ impl App {
 		}
 	}
 
-	fn focus_dir(&mut self, dx: i32, dy: i32) {
-		let area = self.content_area();
-		let next = self.tabs.get(self.active).and_then(|tab| tab.layout.neighbor(area, 1, tab.focus, dx, dy));
-		if let Some(next) = next {
-			self.focus_pane(next);
+	fn zoomed(&self) -> bool {
+		self.tabs.get(self.active).is_some_and(|tab| tab.saved.is_some())
+	}
+
+	fn unzoom_active(&mut self) {
+		if self.zoomed() {
+			self.toggle_zoom();
 		}
+	}
+
+	fn toggle_zoom(&mut self) {
+		let (cols, rows) = self.content_cells();
+		let active = self.active;
+		let Some(tab) = self.tabs.get_mut(active) else { return };
+		match tab.saved.take() {
+			Some(mut saved) => {
+				saved.resize(cols, rows);
+				tab.layout = saved;
+			}
+			None => {
+				// tmux window_zoom: one drawn pane has nothing to zoom over.
+				if tab.layout.leaves().len() < 2 {
+					return;
+				}
+				let focus = tab.focus;
+				tab.saved = Some(std::mem::replace(&mut tab.layout, Layout::new(focus, cols, rows)));
+			}
+		}
+		self.resize_panes();
+	}
+
+	/// The tiled layout: while zoomed, that is the saved one, since the live
+	/// layout holds only the zoomed pane.
+	fn tiled(&self) -> Option<&Layout> {
+		self.tabs.get(self.active).map(|tab| tab.saved.as_ref().unwrap_or(&tab.layout))
+	}
+
+	fn note_human(&mut self, id: PaneId) {
+		self.clock += 1;
+		self.prio.entry(id).or_default().human = self.clock;
+	}
+
+	fn note_ai(&mut self, id: PaneId) {
+		self.clock += 1;
+		self.prio.entry(id).or_default().ai = self.clock;
+	}
+
+	/// layout_set_tiled for an explicit set of drawn windows: rows of panes,
+	/// the last row filling the remainder, exactly as `select-layout tiled`
+	/// builds them. The drawn set is therefore always tiled, not the result of
+	/// stacking splits on one pane.
+	fn retile_ids(&mut self, tab_index: usize, mut drawn: Vec<PaneId>) {
+		let (cols, rows) = self.content_cells();
+		drawn.sort_unstable();
+		drawn.dedup();
+		let Some(tab) = self.tabs.get_mut(tab_index) else { return };
+		tab.saved = None;
+		tab.layout = Layout::tiled(&drawn, cols, rows);
+	}
+
+	/// The windows a tab currently draws (the saved layout while zoomed).
+	fn drawn_ids(tab: &Tab) -> Vec<PaneId> {
+		tab.saved.as_ref().unwrap_or(&tab.layout).leaves()
+	}
+
+	/// Takes the lowest-priority drawn window out of the layout but leaves it
+	/// running, so the tab can draw one more. Its switch time is kept: when it
+	/// comes back it comes back at that place in the order.
+	fn hide_window(&mut self, tab_index: usize, id: PaneId) {
+		let Some(tab) = self.tabs.get(tab_index) else { return };
+		let mut drawn = Self::drawn_ids(tab);
+		if !drawn.contains(&id) {
+			return;
+		}
+		drawn.retain(|pane| *pane != id);
+		let focus = tab.focus;
+		if !tab.hidden.contains(&id) {
+			if let Some(tab) = self.tabs.get_mut(tab_index) {
+				tab.hidden.push(id);
+			}
+		}
+		self.retile_ids(tab_index, drawn.clone());
+		let Some(tab) = self.tabs.get_mut(tab_index) else { return };
+		if focus == id {
+			tab.focus = drawn.first().copied().unwrap_or(id);
+		}
+	}
+
+	fn make_room(&mut self, tab_index: usize) {
+		let Some(tab) = self.tabs.get(tab_index) else { return };
+		let drawn = Self::drawn_ids(tab);
+		if drawn.len() < self.pane_limit {
+			return;
+		}
+		let victim = lowest_priority(&drawn, &self.prio, Some(tab.focus))
+			.or_else(|| lowest_priority(&drawn, &self.prio, None));
+		if let Some(victim) = victim {
+			self.hide_window(tab_index, victim);
+		}
+	}
+
+	/// Puts a hidden window back into the layout; false when the window is too
+	/// small for one more tiled cell.
+	fn show_window(&mut self, tab_index: usize, id: PaneId) -> bool {
+		let (cols, rows) = self.content_cells();
+		let Some(tab) = self.tabs.get(tab_index) else { return false };
+		if !tab.panes.contains_key(&id) {
+			return false;
+		}
+		let mut drawn = Self::drawn_ids(tab);
+		if drawn.contains(&id) {
+			return true;
+		}
+		if !Layout::tiled_fits(drawn.len() + 1, cols, rows) {
+			return false;
+		}
+		let was_empty = drawn.is_empty();
+		drawn.push(id);
+		self.retile_ids(tab_index, drawn);
+		let Some(tab) = self.tabs.get_mut(tab_index) else { return false };
+		tab.hidden.retain(|pane| *pane != id);
+		if was_empty {
+			tab.focus = id;
+		}
+		true
+	}
+
+	/// Only a close makes the drawn set shrink below the limit; the windows
+	/// that were visible stay visible whatever happens to their times.
+	fn fill_limit(&mut self, tab_index: usize) {
+		loop {
+			let next = {
+				let Some(tab) = self.tabs.get(tab_index) else { return };
+				if Self::drawn_ids(tab).len() >= self.pane_limit || tab.hidden.is_empty() {
+					return;
+				}
+				highest_priority(&tab.hidden, &self.prio)
+			};
+			let Some(id) = next else { return };
+			if !self.show_window(tab_index, id) {
+				return;
+			}
+		}
+	}
+
+	fn enforce_limit(&mut self, tab_index: usize) {
+		loop {
+			let victim = {
+				let Some(tab) = self.tabs.get(tab_index) else { return };
+				let drawn = Self::drawn_ids(tab);
+				if drawn.len() <= self.pane_limit {
+					return;
+				}
+				lowest_priority(&drawn, &self.prio, Some(tab.focus))
+					.or_else(|| lowest_priority(&drawn, &self.prio, None))
+			};
+			let Some(victim) = victim else { return };
+			self.hide_window(tab_index, victim);
+		}
+	}
+
+	fn set_pane_limit(&mut self, limit: usize) {
+		self.pane_limit = limit.clamp(1, 6);
+		for index in 0..self.tabs.len() {
+			// A zoomed tab draws one window; the limit counts the tiled ones.
+			if let Some(tab) = self.tabs.get_mut(index) {
+				if let Some(saved) = tab.saved.take() {
+					tab.layout = saved;
+				}
+			}
+			self.enforce_limit(index);
+			self.fill_limit(index);
+		}
+		self.resize_panes();
+	}
+
+	fn focus_dir(&mut self, dx: i32, dy: i32) {
+		let Some(focus) = self.tabs.get(self.active).map(|tab| tab.focus) else { return };
+		let next = self.tiled().and_then(|layout| layout.neighbour(focus, dx, dy));
+		let Some(next) = next else { return };
+		// window_set_active_pane unzooms when the target is not the zoomed pane.
+		self.unzoom_active();
+		self.focus_pane(next);
+		self.note_human(next);
 	}
 
 	fn cycle_pane(&mut self) {
 		let next = self.tabs.get(self.active).and_then(|tab| {
-			let leaves = tab.layout.leaves();
+			let leaves = tab.saved.as_ref().unwrap_or(&tab.layout).leaves();
 			if leaves.len() < 2 {
 				return None;
 			}
 			let pos = leaves.iter().position(|p| *p == tab.focus).unwrap_or(0);
 			Some(leaves[(pos + 1) % leaves.len()])
 		});
-		if let Some(next) = next {
-			self.focus_pane(next);
-		}
+		let Some(next) = next else { return };
+		self.unzoom_active();
+		self.focus_pane(next);
+		self.note_human(next);
 	}
 
 	fn adjust_size(&mut self, axis: Dir, cells: i32) {
-		let area = self.content_area();
-		let cell = if axis == Dir::Right { self.canvas.cell_w } else { self.canvas.cell_h }.max(1);
+		// cmd-resize-pane unzooms before resizing; layout_resize_pane moves the
+		// border by whole cells and may take them from the previous pane.
+		self.unzoom_active();
+		let lc_type = match axis {
+			Dir::Right => LayoutType::LeftRight,
+			Dir::Down => LayoutType::TopBottom,
+		};
 		let Some(tab) = self.tabs.get_mut(self.active) else { return };
-		let mut path = Vec::new();
-		if !tab.layout.split_paths(tab.focus, &mut path) {
-			return;
-		}
-		let mut end = path.len();
-		loop {
-			let prefix = &path[..end];
-			if walk_dir(&mut tab.layout, prefix) == Some(axis) {
-				let usable = if axis == Dir::Right { area.width() - 1 } else { area.height() - 1 };
-				let step = (cells * cell) as f32 / usable.max(1) as f32;
-				let current = walk_ratio(&mut tab.layout, prefix).unwrap_or(0.5);
-				tab.layout.set_ratio(prefix, current + step);
-				break;
-			}
-			if end == 0 {
-				return;
-			}
-			end -= 1;
-		}
+		tab.layout.resize_pane(tab.focus, lc_type, cells, true);
 		self.resize_panes();
 	}
 
@@ -925,31 +1152,15 @@ impl App {
 			return true;
 		}
 		if key.vk == VK_F1 {
-			match self.focused().map(|p| p.owner.clone()) {
-				// The human decides between the AI window's two modes, just as
-				// normal/insert is decided in a window no AI holds.
-				Some(Owner::Agent(agent)) => {
-					if let Some(pane) = self.focused_mut() {
-						pane.owner = Owner::Share(agent);
-					}
-					self.mode = Mode::Insert;
-					self.ime_position(self.hwnd);
-				}
-				Some(Owner::Share(agent)) => {
-					if let Some(pane) = self.focused_mut() {
-						pane.owner = Owner::Agent(agent);
-					}
-					self.mode = Mode::Normal;
-				}
-				_ => {
-					if self.mode == Mode::Normal {
-						self.mode = Mode::Insert;
-						self.ime_position(self.hwnd);
-					} else {
-						self.mode = Mode::Normal;
-					}
+			// F1 lands on the control mode and only that: normal in a window no
+			// AI holds, agent in an AI window. Typing modes are entered with i,
+			// Enter or a click.
+			if let Some(pane) = self.focused_mut() {
+				if let Owner::Share(agent) = pane.owner.clone() {
+					pane.owner = Owner::Agent(agent);
 				}
 			}
+			self.mode = Mode::Normal;
 			return true;
 		}
 		if self.mode == Mode::Normal {
@@ -1050,15 +1261,10 @@ impl App {
 				}
 			}
 			'&' => self.request_close_tab(),
-			'z' => {
-				if let Some(tab) = self.tabs.get_mut(self.active) {
-					tab.zoom = !tab.zoom;
-				}
-				self.resize_panes();
-			}
+			'z' => self.toggle_zoom(),
 			'o' => self.cycle_pane(),
 			'n' => self.next_tab(1),
-			'p' => self.next_tab(-1),
+			'p' => self.modal = Some(Modal::PaneLimit),
 			'w' => self.modal = Some(Modal::Tabs),
 			'[' => {
 				self.scroll_mode = true;
@@ -1075,13 +1281,15 @@ impl App {
 				self.open_group();
 			}
 			'i' => {
+				// Agent is the AI window's normal, so i enters its typing mode,
+				// share, the same way it enters insert elsewhere.
 				if let Some(Owner::Agent(agent)) = self.focused().map(|p| p.owner.clone()) {
 					if let Some(pane) = self.focused_mut() {
 						pane.owner = Owner::Share(agent);
 					}
-					self.mode = Mode::Insert;
-					self.ime_position(self.hwnd);
 				}
+				self.mode = Mode::Insert;
+				self.ime_position(self.hwnd);
 			}
 			'1'..='9' => {
 				let index = (ch as u8 - b'1') as usize;
@@ -1324,30 +1532,59 @@ impl App {
 	}
 
 	fn split_pane(&mut self, dir: Dir) {
+		// cmd-split-window unzooms the window before tiling the new pane.
+		self.unzoom_active();
+		let active = self.active;
+		let Some(tab) = self.tabs.get(active) else { return };
+		// A limit of one replaces the drawn window instead of finding space
+		// next to it.
+		let replaces = tab.layout.leaves().len() == 1 && self.pane_limit == 1;
+		if !replaces && !tab.layout.can_split(tab.focus, dir) {
+			self.modal = Some(Modal::Notice(String::from("窗口太小，再分没有空间了。")));
+			return;
+		}
 		let command = self.shell.clone();
 		let envs = self.child_env.clone();
 		let Some((id, term)) = self.spawn_term(&command, &envs) else { return };
-		let tab = self.active;
-		self.insert_pane(tab, id, Body::Term(term), Owner::Normal, false, 0, None, true, Some(dir));
+		let (cols, rows) = self.content_cells();
+		self.make_room(active);
+		let Some(tab) = self.tabs.get_mut(active) else { return };
+		if tab.layout.leaves().is_empty() {
+			tab.layout = Layout::new(id, cols, rows);
+		} else {
+			let focus = tab.focus;
+			if !tab.layout.split(focus, id, dir) {
+				return;
+			}
+		}
+		tab.panes.insert(id, Pane { id, body: Body::Term(term), owner: Owner::Normal, seen: false, ai_created: false, creator: None, title: None, group_id: 0, member: None });
+		tab.focus = id;
+		self.note_human(id);
+		self.resize_panes();
+		self.mode = Mode::Insert;
 	}
 
 	fn break_pane(&mut self) {
+		// cmd-break-pane runs server_unzoom_window first.
+		self.unzoom_active();
+		let (cols, rows) = self.content_cells();
 		let active = self.active;
 		let Some(tab) = self.tabs.get_mut(active) else { return };
 		if tab.panes.len() < 2 {
 			return;
 		}
 		let id = tab.focus;
-		if !tab.layout.remove(id) {
-			return;
-		}
-		tab.zoom = false;
+		let mut drawn = Self::drawn_ids(tab);
+		drawn.retain(|pane| *pane != id);
+		tab.hidden.retain(|pane| *pane != id);
 		let Some(pane) = tab.panes.remove(&id) else { return };
-		tab.focus = tab.layout.leaves().first().copied().unwrap_or(0);
+		tab.focus = drawn.first().copied().unwrap_or(0);
+		self.retile_ids(active, drawn);
 		let mut panes = HashMap::new();
 		panes.insert(id, pane);
-		self.tabs.push(Tab { layout: Layout::leaf(id), panes, focus: id, zoom: false });
+		self.tabs.push(Tab { layout: Layout::new(id, cols, rows), saved: None, panes, focus: id, hidden: Vec::new() });
 		self.active = self.tabs.len() - 1;
+		self.fill_limit(active);
 		self.resize_panes();
 		self.mode = Mode::Insert;
 	}
@@ -1359,6 +1596,8 @@ impl App {
 		let len = self.tabs.len() as i32;
 		let next = ((self.active as i32 + delta) % len + len) % len;
 		self.active = next as usize;
+		let focus = self.tabs[next as usize].focus;
+		self.note_human(focus);
 		self.mark_seen();
 	}
 
@@ -1536,6 +1775,9 @@ impl App {
 		let Some(id) = self.mouse_target(x, y) else { return };
 		let already_focused = self.focused_id() == Some(id);
 		self.focus_pane(id);
+		if !already_focused {
+			self.note_human(id);
+		}
 		// Five window modes. Clicking into an AI window from outside always lands
 		// in agent, the way a plain window lands in normal; clicking inside the
 		// share window keeps the human typing.
@@ -1858,7 +2100,11 @@ impl App {
 		let Some(index) = self.tab_index_of(id) else { return };
 		let last = self.tabs[index].panes.len() <= 1;
 		if last {
+			let gone: Vec<PaneId> = self.tabs[index].panes.keys().copied().collect();
 			self.tabs.remove(index);
+			for gone in gone {
+				self.prio.remove(&gone);
+			}
 			if index < self.active {
 				self.active -= 1;
 			}
@@ -1867,15 +2113,19 @@ impl App {
 			}
 			return;
 		}
+		let mut drawn = Self::drawn_ids(&self.tabs[index]);
+		drawn.retain(|pane| *pane != id);
 		let tab = &mut self.tabs[index];
-		tab.layout.remove(id);
+		tab.hidden.retain(|pane| *pane != id);
 		tab.panes.remove(&id);
 		if tab.focus == id {
-			tab.focus = tab.layout.leaves().first().copied().unwrap_or(0);
+			tab.focus = drawn.first().copied().unwrap_or(0);
 		}
-		if tab.zoom {
-			tab.zoom = false;
-		}
+		self.retile_ids(index, drawn);
+		self.prio.remove(&id);
+		// The closed window frees one draw slot; the next one in the priority
+		// order takes it.
+		self.fill_limit(index);
 	}
 
 	fn close_tab_direct(&mut self, index: usize) {
@@ -1911,7 +2161,11 @@ impl App {
 		// Page removal may have dropped tabs before this one; relocate it.
 		let index = self.tab_index_of(anchor).unwrap_or(index);
 		if index < self.tabs.len() {
+			let gone: Vec<PaneId> = self.tabs[index].panes.keys().copied().collect();
 			self.tabs.remove(index);
+			for gone in gone {
+				self.prio.remove(&gone);
+			}
 			if index < self.active {
 				self.active -= 1;
 			}
@@ -2044,19 +2298,22 @@ impl App {
 			.map(|p| p.id);
 		if let Some(id) = existing {
 			self.focus_pane(id);
+			self.note_ai(id);
 			return;
 		}
 		let Some(server_url) = self.server.as_ref().map(|server| server.client.url.clone()) else {
 			self.modal = Some(Modal::Notice(String::from("opencode server 没有起来，打不开 AI 页面。")));
 			return;
 		};
-		let command = format!("\"{}\" --server {} --session {}", crate::opencode::program(), server_url, session);
+		// The ConPTY console starts on the system ANSI code page; opencode writes
+		// UTF-8 bytes, so its page would arrive as mojibake. chcp runs in the
+		// same console before opencode, whose own console test fixture sets both
+		// code pages to 65001 the same way. The outer quotes let cmd keep the
+		// quoted program path; taskkill /T still takes the whole tree on close.
+		let program = format!("\"{}\" --server {} --session {}", crate::opencode::program(), server_url, session);
+		let command = format!("cmd /d /s /c \"chcp 65001>nul & {program}\"");
 		let Some(tab_index) = self.tab_index_of(group_pane) else { return };
-		let Some(id) = self.add_terminal(tab_index, &command, Owner::Normal, false, group, Some(String::from(name)), true) else {
-			return;
-		};
-		let _ = id;
-		self.resize_panes();
+		let _ = self.add_terminal(tab_index, &command, Owner::Normal, false, group, Some(String::from(name)), true);
 	}
 
 	fn close_member_page(&mut self, group: u64, name: &str) {
@@ -2244,7 +2501,8 @@ impl App {
 				let mut tabs = Vec::new();
 				for (index, tab) in self.tabs.iter().enumerate() {
 					let mut panes = Vec::new();
-					for id in tab.layout.leaves() {
+					let drawn: Vec<PaneId> = tab.saved.as_ref().unwrap_or(&tab.layout).leaves();
+					for id in drawn.iter().copied().chain(tab.hidden.iter().copied()) {
 						let Some(pane) = tab.panes.get(&id) else { continue };
 						let events: Vec<Value> = self
 							.events
@@ -2258,6 +2516,7 @@ impl App {
 							"kind": Self::pane_kind(pane),
 							"owner": owner_label(&pane.owner),
 							"seen": pane.seen,
+							"shown": drawn.contains(&id),
 							"focused": pane.id == tab.focus,
 							"events": events,
 						}));
@@ -2284,6 +2543,7 @@ impl App {
 				let Body::Solid(editor) = &mut pane.body else { return Err(String::from("这个窗口不是 solid")) };
 				editor.replace_all(text);
 				editor.save().map_err(|err| format!("窗口内容已更新但文件保存失败：{err}"))?;
+				self.note_ai(id);
 				Ok(json!({"text": format!("已写入窗口 {id} 并保存文件")}))
 			}
 			"run_in_terminal" => {
@@ -2310,12 +2570,12 @@ impl App {
 					member: Some(agent.to_string()),
 					expires: None,
 				});
+				self.note_ai(id);
 				Ok(json!({"text": format!("已在窗口 {id} 输入命令；事件 {event_id} 绑着这个窗口，用 stop_event {event_id} 释放")}))
 			}
 			"create_window" => {
 				let kind = args["kind"].as_str().unwrap_or("terminal");
 				self.prune_ai_panes();
-				let tab = self.active;
 				let before = self.focused_id();
 				let id = match kind {
 					"solid" => {
@@ -2327,7 +2587,7 @@ impl App {
 						let editor = Editor::open(path, false).map_err(|err| format!("文件没有打开：{err}"))?;
 						let id = self.next_pane;
 						self.next_pane += 1;
-						self.insert_pane(tab, id, Body::Solid(editor), Owner::Normal, true, 0, None, false, None);
+						self.add_tab(id, Body::Solid(editor), Owner::Normal, true, 0, None, false);
 						Some(id)
 					}
 					"even" => {
@@ -2338,12 +2598,15 @@ impl App {
 						let group = GroupPane::new(&name, &root, self.client.clone());
 						let id = self.next_pane;
 						self.next_pane += 1;
-						self.insert_pane(tab, id, Body::Even(Box::new(group)), Owner::Normal, true, group_id, None, false, None);
+						self.add_tab(id, Body::Even(Box::new(group)), Owner::Normal, true, group_id, None, false);
 						Some(id)
 					}
 					_ => {
 						let command = args["command"].as_str().unwrap_or(&self.shell).to_string();
-						self.add_terminal(tab, &command, Owner::Normal, true, 0, None, false)
+						let envs = self.child_env.clone();
+						let (id, term) = self.spawn_term(&command, &envs).ok_or_else(|| String::from("终端没有启动"))?;
+						self.add_tab(id, Body::Term(term), Owner::Normal, true, 0, None, false);
+						Some(id)
 					}
 				};
 				if let Some(previous) = before {
@@ -2495,6 +2758,8 @@ impl App {
 					let index = (ch as u8 - b'1') as usize;
 					if index < self.tabs.len() {
 						self.active = index;
+						let focus = self.tabs[index].focus;
+						self.note_human(focus);
 						self.mark_seen();
 					}
 				}
@@ -2519,6 +2784,10 @@ impl App {
 					self.modal = Some(Modal::CloseAgent { pane, agent });
 				}
 			}
+			Some(Modal::PaneLimit) => match key.ch {
+				Some(ch @ '1'..='6') => self.set_pane_limit((ch as u8 - b'0') as usize),
+				_ => self.modal = Some(Modal::PaneLimit),
+			},
 			None => {}
 		}
 	}
@@ -2530,10 +2799,10 @@ impl App {
 				(
 					String::from("Delta 帮助"),
 					vec![
-						String::from("普通 / 输入模式：F1 切换；Esc 永远原样送给程序"),
+						String::from("普通 / 输入模式：F1 回普通（AI 窗口回 agent）；Esc 永远原样送给程序"),
 						String::from("普通：c 新标签  % 右分屏  \" 下分屏  x 关窗口  & 关标签"),
 						String::from("      z 缩放  o 轮换窗口  方向键换窗口  Ctrl+方向键调大小"),
-						String::from("      n / p 换标签  1-9 选标签  w 标签列表  [ 滚屏/复制模式"),
+						String::from("      n 下一个标签  p 同屏窗口数  1-9 选标签  w 标签列表  [ 滚屏/复制模式"),
 						String::from("      ! 拆成新标签  q 窗口编号  e 打开文件  g 群聊  ? 帮助"),
 						String::from("输入：Enter 回车  Ctrl+V 粘贴（图片落成路径）  F1 回普通"),
 						String::from("鼠标：拖动选择；普通模式下 Ctrl+C 复制；终端要鼠标时按 Shift 拖动仍可选中"),
@@ -2577,6 +2846,18 @@ impl App {
 				}
 				lines.push(String::from("按 1-9 切换；Esc 关闭"));
 				(String::from("标签"), lines)
+			}
+			Some(Modal::PaneLimit) => {
+				let marks: Vec<String> =
+					(1..=6).map(|n| if n == self.pane_limit { format!("[{n}]") } else { format!(" {n} ") }).collect();
+				(
+					String::from("同屏窗口数"),
+					vec![
+						marks.join(" "),
+						format!("现在最多显示 {} 个；按 1-6 设置，Esc 关闭", self.pane_limit),
+						String::from("已经显示的窗口不会被后来的挤掉；只有它关闭，才补进下一个。"),
+					],
+				)
 			}
 			Some(Modal::Notice(text)) => (String::from("提示"), text.lines().map(String::from).collect()),
 			None => (String::new(), Vec::new()),
@@ -2712,7 +2993,7 @@ impl App {
 				None,
 			),
 		};
-		let zoom = self.tabs.get(self.active).map(|t| t.zoom).unwrap_or(false);
+		let zoom = self.tabs.get(self.active).map(|t| t.saved.is_some()).unwrap_or(false);
 		let prefix = format!("{mode_label}  ");
 		let tail = format!(
 			"tab {}/{}  pane {}{} ",
@@ -2804,6 +3085,19 @@ fn scroll_body(body: &mut Body, delta: i32) {
 	}
 }
 
+fn priority_key(prio: &HashMap<PaneId, Priority>, id: PaneId) -> (u64, u64, PaneId) {
+	let entry = prio.get(&id).copied().unwrap_or_default();
+	(entry.human, entry.ai, id)
+}
+
+fn highest_priority(ids: &[PaneId], prio: &HashMap<PaneId, Priority>) -> Option<PaneId> {
+	ids.iter().copied().max_by_key(|id| priority_key(prio, *id))
+}
+
+fn lowest_priority(ids: &[PaneId], prio: &HashMap<PaneId, Priority>, except: Option<PaneId>) -> Option<PaneId> {
+	ids.iter().copied().filter(|id| Some(*id) != except).min_by_key(|id| priority_key(prio, *id))
+}
+
 fn owner_label(owner: &Owner) -> String {
 	match owner {
 		Owner::Normal => String::from("normal"),
@@ -2829,46 +3123,6 @@ fn owner_color(owner: &Owner) -> u32 {
 		Owner::Normal => canvas::rgb(canvas::BORDER.0, canvas::BORDER.1, canvas::BORDER.2),
 		Owner::Agent(_) => canvas::rgb(150, 110, 200),
 		Owner::Share(_) => canvas::rgb(110, 180, 130),
-	}
-}
-
-fn walk_dir(layout: &mut Layout, prefix: &[bool]) -> Option<Dir> {
-	let mut node = layout;
-	for branch in prefix {
-		node = match node {
-			Layout::Split { a, b, .. } => {
-				if *branch {
-					b
-				} else {
-					a
-				}
-			}
-			Layout::Leaf(_) => return None,
-		};
-	}
-	match node {
-		Layout::Split { dir, .. } => Some(*dir),
-		Layout::Leaf(_) => None,
-	}
-}
-
-fn walk_ratio(layout: &mut Layout, prefix: &[bool]) -> Option<f32> {
-	let mut node = layout;
-	for branch in prefix {
-		node = match node {
-			Layout::Split { a, b, .. } => {
-				if *branch {
-					b
-				} else {
-					a
-				}
-			}
-			Layout::Leaf(_) => return None,
-		};
-	}
-	match node {
-		Layout::Split { ratio, .. } => Some(*ratio),
-		Layout::Leaf(_) => None,
 	}
 }
 
@@ -3022,3 +3276,49 @@ fn set_clipboard(text: &str) {
 	}
 }
 
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn later_human_switch_comes_first() {
+		let mut prio = HashMap::new();
+		prio.insert(1, Priority { human: 3, ai: 9 });
+		prio.insert(2, Priority { human: 8, ai: 0 });
+		assert_eq!(lowest_priority(&[1, 2], &prio, None), Some(1));
+		assert_eq!(highest_priority(&[1, 2], &prio), Some(2));
+	}
+
+	#[test]
+	fn equal_human_times_fall_back_to_the_ai_time() {
+		let mut prio = HashMap::new();
+		prio.insert(4, Priority { human: 5, ai: 1 });
+		prio.insert(9, Priority { human: 5, ai: 7 });
+		assert_eq!(highest_priority(&[4, 9], &prio), Some(9));
+		assert_eq!(lowest_priority(&[9, 4], &prio, None), Some(4));
+	}
+
+	#[test]
+	fn identical_times_fall_back_to_the_window_number() {
+		let mut prio = HashMap::new();
+		prio.insert(3, Priority::default());
+		prio.insert(6, Priority::default());
+		assert_eq!(highest_priority(&[3, 6], &prio), Some(6));
+		assert_eq!(lowest_priority(&[6, 3], &prio, None), Some(3));
+	}
+
+	#[test]
+	fn the_focused_window_is_not_the_one_made_room_with() {
+		let mut prio = HashMap::new();
+		prio.insert(1, Priority { human: 1, ai: 0 });
+		prio.insert(2, Priority { human: 2, ai: 0 });
+		prio.insert(3, Priority { human: 3, ai: 0 });
+		assert_eq!(lowest_priority(&[1, 2, 3], &prio, Some(1)), Some(2));
+		// When the oldest is the focused one, the next oldest steps out.
+		assert_eq!(lowest_priority(&[1, 2, 3], &prio, Some(2)), Some(1));
+		// A tab drawing a single window has to give that one up.
+		assert_eq!(lowest_priority(&[1], &prio, Some(1)), None);
+		assert_eq!(lowest_priority(&[1], &prio, None), Some(1));
+	}
+}
