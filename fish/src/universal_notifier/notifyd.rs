@@ -37,7 +37,7 @@ pub struct NotifydNotifier {
 impl NotifydNotifier {
     pub fn new() -> Option<Self> {
         // Per notify(3), the user.uid.%d style is only accessible to processes with that uid.
-        let program_name = *PROGRAM_NAME.get().unwrap_or(&L!("fish"));
+        let program_name = *PROGRAM_NAME.get().unwrap_or(&L!("odd"));
         let local_name = format!(
             "user.uid.{}.{}.uvars",
             unistd::getuid().as_raw(),

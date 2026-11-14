@@ -202,6 +202,10 @@ const BUILTIN_DATAS: &[BuiltinData] = &[
         func: count::count,
     },
     BuiltinData {
+        name: L!("cp"),
+        func: cp::cp,
+    },
+    BuiltinData {
         name: L!("disown"),
         func: disown::disown,
     },
@@ -274,8 +278,16 @@ const BUILTIN_DATAS: &[BuiltinData] = &[
         func: jobs::jobs,
     },
     BuiltinData {
+        name: L!("ls"),
+        func: ls::ls,
+    },
+    BuiltinData {
         name: L!("math"),
         func: math::math,
+    },
+    BuiltinData {
+        name: L!("md"),
+        func: mkdir::mkdir,
     },
     BuiltinData {
         name: L!("mkdir"),
@@ -508,6 +520,7 @@ pub fn builtin_get_desc(name: &wstr) -> Option<&'static wstr> {
         _ if name == "contains" => wgettext!("Search for a specified string in a list"),
         _ if name == "continue" => wgettext!("Skip over remaining innermost loop"),
         _ if name == "count" => wgettext!("Count the number of arguments"),
+        _ if name == "cp" => wgettext!("Copy files and directories"),
         _ if name == "disown" => wgettext!("Remove job from job list"),
         _ if name == "echo" => wgettext!("Print arguments"),
         _ if name == "else" => wgettext!("Evaluate block if condition is false"),
@@ -525,7 +538,9 @@ pub fn builtin_get_desc(name: &wstr) -> Option<&'static wstr> {
         _ if name == "history" => wgettext!("History of commands executed by user"),
         _ if name == "if" => wgettext!("Evaluate block if condition is true"),
         _ if name == "jobs" => wgettext!("Print currently running jobs"),
+        _ if name == "ls" => wgettext!("List directory contents"),
         _ if name == "math" => wgettext!("Evaluate math expressions"),
+        _ if name == "md" => wgettext!("Create directories"),
         _ if name == "mkdir" => wgettext!("Create directories"),
         _ if name == "not" => wgettext!("Negate exit status of job"),
         _ if name == "or" => wgettext!("Execute command if previous command failed"),

@@ -267,6 +267,7 @@ pub struct Screen {
 	pub modes: Modes,
 	pub title: String,
 	pub cwd: Option<String>,
+	pub command_finished: Option<i32>,
 	pub cursor_style: u8,
 	pub sync_updates: bool,
 	pub bell: bool,
@@ -304,6 +305,7 @@ impl Screen {
 			modes: Modes::default(),
 			title: String::new(),
 			cwd: None,
+			command_finished: None,
 			cursor_style: 0,
 			sync_updates: false,
 			bell: false,
@@ -421,9 +423,23 @@ impl Screen {
 		let total = self.scrollback.len() + self.primary.rows.len();
 		let mut out = String::new();
 		for i in 0..total {
-			if let Some(line) = self.line_text(i) {
-				out.push_str(&line);
-				out.push('\n');
+			if let Some(row) = self.row_abs(i) {
+				let mut line = String::new();
+				for cell in &row.cells {
+					if cell.wide == 2 {
+						continue;
+					}
+					line.push(cell.ch);
+					if cell.has_comb {
+						line.push(cell.comb);
+					}
+				}
+				if row.wrapped {
+					out.push_str(&line);
+				} else {
+					out.push_str(line.trim_end_matches(' '));
+					out.push('\n');
+				}
 			}
 		}
 		out
@@ -432,12 +448,19 @@ impl Screen {
 	pub fn alt_text(&self) -> String {
 		let mut out = String::new();
 		for row in &self.alt.rows {
-			let mut s: String = row.cells.iter().filter(|c| c.wide != 2).map(|c| c.ch).collect();
-			while s.ends_with(' ') {
-				s.pop();
+			let mut s = String::new();
+			for cell in row.cells.iter().filter(|c| c.wide != 2) {
+				s.push(cell.ch);
+				if cell.has_comb {
+					s.push(cell.comb);
+				}
 			}
-			out.push_str(&s);
-			out.push('\n');
+			if row.wrapped {
+				out.push_str(&s);
+			} else {
+				out.push_str(s.trim_end_matches(' '));
+				out.push('\n');
+			}
 		}
 		out
 	}
@@ -468,7 +491,7 @@ impl Screen {
 					out.push(c.comb);
 				}
 			}
-			if r != er {
+			if r != er && !row.wrapped {
 				out.push('\n');
 			}
 		}
@@ -1557,6 +1580,15 @@ impl Screen {
 					}
 				}
 			}
+			"133" => {
+				let s = String::from_utf8_lossy(rest);
+				let mut parts = s.split(';');
+				match parts.next() {
+					Some("C") => self.command_finished = None,
+					Some("D") => self.command_finished = Some(parts.next().and_then(|status| status.parse().ok()).unwrap_or(0)),
+					_ => {}
+				}
+			}
 			"4" => {
 				let s = String::from_utf8_lossy(rest);
 				let mut it = s.split(';');
@@ -1629,6 +1661,7 @@ impl Screen {
 		self.modes = Modes::default();
 		self.title.clear();
 		self.cwd = None;
+		self.command_finished = None;
 		self.cursor_style = 0;
 		self.sync_updates = false;
 		self.palette = [None; 256];

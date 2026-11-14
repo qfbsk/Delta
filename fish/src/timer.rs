@@ -119,7 +119,7 @@ impl TimerSnapshot {
                 output,
                 "\nExecuted in  {wall_time:6.2} {wall_unit:<width1$}    {fish:<width2$}  external",
                 width1 = column2_unit_len,
-                fish = "fish",
+                fish = "odd",
                 width2 = fish_unit.len() + 7
             )
             .unwrap();

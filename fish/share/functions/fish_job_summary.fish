@@ -30,15 +30,15 @@ function fish_job_summary -a job_id is_foreground cmd_line signal_or_end_name si
     set -l message
     switch $signal_or_end_name
         case STOPPED
-            set message (printf ( _ "fish: Job %s, '%s' has stopped\n" ) $job_id $cmd_line)
+            set message (printf ( _ "odd: Job %s, '%s' has stopped\n" ) $job_id $cmd_line)
         case ENDED
-            set message (printf ( _ "fish: Job %s, '%s' has ended\n" ) $job_id $cmd_line)
+            set message (printf ( _ "odd: Job %s, '%s' has ended\n" ) $job_id $cmd_line)
         case 'SIG*'
             if test -n "$proc_pid"
-                set message (printf ( _ "fish: Process %s, '%s' from job %s, '%s' terminated by signal %s (%s)\n" ) \
+                set message (printf ( _ "odd: Process %s, '%s' from job %s, '%s' terminated by signal %s (%s)\n" ) \
                     $proc_pid $proc_name $job_id $cmd_line $signal_or_end_name $signal_desc)
             else
-                set message (printf ( _ "fish: Job %s, '%s' terminated by signal %s (%s)\n" ) \
+                set message (printf ( _ "odd: Job %s, '%s' terminated by signal %s (%s)\n" ) \
                     $job_id $cmd_line $signal_or_end_name $signal_desc)
             end
     end

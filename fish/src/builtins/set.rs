@@ -11,7 +11,7 @@ use crate::{
     parser::ParserEnvSetMode,
     wutil::wcstoi::{self, wcstoi_partial},
 };
-use fish_common::{EscapeFlags, EscapeStringStyle, escape, escape_string, help_section};
+use fish_common::{EscapeFlags, EscapeStringStyle, escape, escape_string};
 use fish_widestring::ELLIPSIS_CHAR;
 
 #[derive(Clone)]
@@ -189,10 +189,7 @@ impl Options {
                     let optind = w.wopt_index;
                     // implicit drop(w); here
                     if args[optind - 1].starts_with("-o") {
-                        let mut err = err_fmt!(
-                            "fish does not have shell options. See `help %s`.",
-                            help_section!("fish_for_bash_users")
-                        );
+                        let mut err = err_fmt!("odd does not have shell options. See `help`.");
 
                         if optind < args.len() {
                             err.append_assign_to_msg('\n');

@@ -1,7 +1,7 @@
 #![cfg_attr(
-    all(nightly, feature = "benchmark"),
-    feature(test),
-    allow(unused_features)
+	all(nightly, feature = "benchmark"),
+	feature(test),
+	allow(unused_features)
 )]
 
 pub const BUILD_VERSION: &str = env!("FISH_BUILD_VERSION");
@@ -61,6 +61,7 @@ pub mod re;
 pub mod reader;
 pub mod redirection;
 pub mod screen;
+pub mod shell;
 pub mod signal;
 pub mod stdx;
 pub mod terminal;

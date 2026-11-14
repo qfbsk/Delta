@@ -1,3 +1,6 @@
+// GUI 程序：控制台子系统会让 Windows 在从终端以外启动时额外开一个控制台窗口。
+#![windows_subsystem = "windows"]
+
 mod app;
 mod canvas;
 mod even;

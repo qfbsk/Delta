@@ -708,7 +708,7 @@ pub fn env_init(paths: Option<&ConfigPaths>, no_config: bool) {
     vars.set_one(L!("fish_pid"), global_mode, getpid().as_raw().to_wstring());
 
     // Set the $hostname variable
-    let hostname: WString = gethostname().map_or("fish".into(), osstr2wcstring);
+    let hostname: WString = gethostname().map_or("odd".into(), osstr2wcstring);
     vars.set_one(L!("hostname"), global_mode, hostname);
 
     // Set up SHLVL variable. Not we can't use vars.get() because SHLVL is read-only, and therefore

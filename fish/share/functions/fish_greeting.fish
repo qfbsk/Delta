@@ -1,12 +1,12 @@
 function fish_greeting
     if not set -q fish_greeting
-        set -l line1 (_ 'Welcome to fish, the friendly interactive shell')
-        set -l line2 \n(printf (_ 'Type %shelp%s for instructions on how to use fish') (set_color green) (set_color --reset))
+        set -l line1 (_ 'Welcome to odd, the friendly interactive shell')
+        set -l line2 \n(printf (_ 'Type %shelp%s for instructions on how to use odd') (set_color green) (set_color --reset))
         set -g fish_greeting "$line1$line2"
     end
 
     if set -q fish_private_mode && set -q fish_greeting[1]
-        set -l line (_ "fish is running in private mode, history will not be persisted.")
+        set -l line (_ "odd is running in private mode, history will not be persisted.")
         set -g fish_greeting $fish_greeting\n$line
     end
 

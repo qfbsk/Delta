@@ -459,7 +459,7 @@ pub fn status(parser: &mut Parser, streams: &mut IoStreams, args: &mut [&wstr]) 
         Language => {
             cfg_if! {
                 if #[cfg(not(feature = "localize-messages"))] {
-                    err_raw!(L!("fish was built with the `localize-messages` feature disabled. The `status language` command is unavailable.").to_owned())
+                    err_raw!(L!("odd was built with the `localize-messages` feature disabled. The `status language` command is unavailable.").to_owned())
                                 .finish(streams);
                     return Err(STATUS_CMD_ERROR);
                 } else {

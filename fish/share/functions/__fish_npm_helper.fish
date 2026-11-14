@@ -13,7 +13,7 @@ function __npm_helper_installed
         if not set -qg __fish_npm_pkg_info_shown
             set -l old (commandline)
             commandline -r ""
-            echo \nfish: Run `$argv[1] all-the-package-names` to gain intelligent \
+            echo \nodd: Run `$argv[1] all-the-package-names` to gain intelligent \
                 package completion >&2
             commandline -f repaint
             commandline -r $old

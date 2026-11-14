@@ -161,6 +161,20 @@ mod imp {
                             key.dwControlKeyState & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED) != 0;
                         // With processed input on, ^C becomes a console event instead of data.
                         if key_down && ch != 0 && !(processed && ch == 0x03) {
+                            // In virtual-terminal input mode conhost delivers Ctrl+Z as a plain
+                            // character record, and the CRT's read reports that record as zero
+                            // bytes instead of 0x1a. readb() reads zero bytes as "terminal
+                            // closed", so take this record ourselves and queue the byte.
+                            if vk == 0 && scan == 0 && ch == 0x1a {
+                                let mut consumed = 0u32;
+                                if unsafe {
+                                    ReadConsoleInputW(handle, record.as_mut_ptr(), 1, &mut consumed)
+                                } != 0
+                                    && consumed == 1
+                                {
+                                    fish_common::os::console_queue_input_byte(0x1a);
+                                }
+                            }
                             char_ready = true;
                             break;
                         }

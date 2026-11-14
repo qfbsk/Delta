@@ -7,7 +7,7 @@ function __fish_theme_freeze
 
     set -l help_section interactive#syntax-highlighting
     status get-file help_sections | string match -q $help_section
-    or echo "fish: internal error: missing help section '$help_section'"
+    or echo "odd: internal error: missing help section '$help_section'"
 
     mkdir -p -- $__fish_config_dir/conf.d
     printf >$__fish_config_dir/$relative_path %s\n \

@@ -33,7 +33,8 @@ use windows_sys::Win32::Graphics::Gdi::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
 	CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW, GetClientRect,
 	GetForegroundWindow, GetMessageW, GetWindowLongPtrW, LoadCursorW, PostQuitMessage,
-	RegisterClassW, SendMessageW, SetTimer, SetWindowLongPtrW, ShowWindow, UnregisterClassW,
+	RegisterClassW, SendMessageW, SetTimer, SetWindowLongPtrW, ShowWindow, TranslateMessage,
+	UnregisterClassW,
 	CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, IDC_ARROW,
 	MSG, SW_SHOW, WM_APP, WM_CHAR, WM_CLOSE, WM_COPYDATA, WM_DESTROY, WM_ERASEBKGND, WM_IME_CHAR,
 	WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP,
@@ -143,6 +144,7 @@ pub struct App {
 	server: Option<crate::opencode::Server>,
 	client: Option<Client>,
 	mcp: Option<McpServer>,
+	pending_takeovers: Vec<mcp::McpRequest>,
 	child_env: Vec<(String, String)>,
 	shell: String,
 	drag: Option<Drag>,
@@ -216,6 +218,9 @@ pub fn run(shell: Option<String>, file: Option<PathBuf>) -> i32 {
 
 		let mut msg: MSG = zeroed();
 		while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
+			// IME 只有在消息循环里经过 TranslateMessage 才会处理按键，缺这一步
+			// 中文输入法不会出候选、也不会提交汉字。
+			TranslateMessage(&msg);
 			DispatchMessageW(&msg);
 		}
 		SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
@@ -242,14 +247,25 @@ impl App {
 		}
 		let (width, height) = (client.right - client.left, client.bottom - client.top);
 		canvas.resize(hwnd, width, height);
-		let server = crate::opencode::Server::start().ok();
-		let client = server.as_ref().map(|s| s.client.clone());
 		let mcp = mcp::start().ok();
+		let server = crate::opencode::Server::start().ok();
+		let client = server.as_ref().map(|s| {
+			let mut client = s.client.clone();
+			client.mcp_url = mcp.as_ref().map(|m| m.url.clone());
+			client
+		});
 		let mut child_env = server.as_ref().map(|s| s.env()).unwrap_or_default();
 		if let Some(mcp) = &mcp {
 			child_env.push((String::from("DELTA_MCP_URL"), mcp.url.clone()));
 		}
 		if let Ok(exe) = std::env::current_exe() {
+			if let Some(dir) = exe.parent() {
+				let mut paths = vec![dir.to_path_buf()];
+				paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()));
+				if let Ok(path) = std::env::join_paths(paths) {
+					child_env.push((String::from("PATH"), path.to_string_lossy().into_owned()));
+				}
+			}
 			let exe = exe.to_string_lossy().into_owned();
 			child_env.push((String::from("DELTA_EXE"), exe.clone()));
 			child_env.push((String::from("SOLID"), exe));
@@ -276,6 +292,7 @@ impl App {
 			server,
 			client,
 			mcp,
+			pending_takeovers: Vec::new(),
 			child_env,
 			shell,
 			drag: None,
@@ -286,7 +303,8 @@ impl App {
 		};
 		if let Some(path) = file {
 			app.open_editor(path);
-		} else {
+		}
+		if app.tabs.is_empty() {
 			app.new_terminal_tab();
 		}
 		Ok(app)
@@ -400,9 +418,7 @@ impl App {
 				0
 			}
 			WM_CLOSE => {
-				unsafe {
-					DestroyWindow(hwnd);
-				}
+				self.request_close_app();
 				0
 			}
 			WM_DESTROY => {
@@ -419,10 +435,14 @@ impl App {
 	fn tick(&mut self) {
 		let ids: Vec<PaneId> = self.tabs.iter().flat_map(|t| t.panes.keys().copied()).collect();
 		let mut ended = Vec::new();
+		let mut finished = Vec::new();
 		for id in ids {
 			if let Some(pane) = self.pane_mut(id) {
 				if let Body::Term(term) = &mut pane.body {
 					term.drain();
+					if term.screen.command_finished.take().is_some() {
+						finished.push(id);
+					}
 					if !term.exited && term.process_exited() {
 						ended.push(id);
 					}
@@ -432,10 +452,15 @@ impl App {
 		for id in ended {
 			self.term_exit(id);
 		}
+		for id in finished {
+			self.events.retain(|event| event.pane != id);
+			self.clear_owner_if_idle(id);
+		}
 		self.handle_even_events();
 		self.sync_events();
 		self.handle_mcp();
 		self.mark_seen();
+		self.sync_keyboard_mode();
 		self.paint();
 	}
 
@@ -526,10 +551,30 @@ impl App {
 		if let Some(tab) = self.tabs.get_mut(active) {
 			let focus = tab.focus;
 			if let Some(pane) = tab.panes.get_mut(&focus) {
-				if pane.owner == Owner::Normal {
+				if pane.owner == Owner::Normal && self.mode != Mode::Normal {
+					if !pane.seen {
+						self.auth.retain(|(id, _), _| *id != focus);
+					}
 					pane.seen = true;
 				}
 			}
+		}
+	}
+
+	/// Agent is the AI window's normal, share its insert; whichever way focus
+	/// arrived, the keyboard mode must match the window mode.
+	fn sync_keyboard_mode(&mut self) {
+		if self.scroll_mode {
+			return;
+		}
+		let Some(owner) = self.focused().map(|pane| pane.owner.clone()) else { return };
+		let want = match owner {
+			Owner::Agent(_) => Mode::Normal,
+			Owner::Share(_) => Mode::Insert,
+			Owner::Normal => return,
+		};
+		if self.mode != want {
+			self.mode = want;
 		}
 	}
 
@@ -685,18 +730,23 @@ impl App {
 		}
 	}
 
-	fn open_editor(&mut self, path: PathBuf) -> PaneId {
+	fn open_editor(&mut self, path: PathBuf) -> Option<PaneId> {
 		if let Some(id) = self.find_solid(&path) {
 			self.focus_pane_anywhere(id);
-			return id;
+			return Some(id);
 		}
-		let content = if path.is_file() { std::fs::read_to_string(&path).unwrap_or_default() } else { String::new() };
-		let editor = Editor::new(path, content, false);
+		let editor = match Editor::open(path.clone(), false) {
+			Ok(editor) => editor,
+			Err(err) => {
+				self.modal = Some(Modal::Notice(format!("无法读取 {}：{err}。文件没有被改动。", path.display())));
+				return None;
+			}
+		};
 		let id = self.next_pane;
 		self.next_pane += 1;
 		let tab = self.active;
 		self.insert_pane(tab, id, Body::Solid(editor), Owner::Normal, false, 0, None, true, None);
-		id
+		Some(id)
 	}
 
 	fn find_solid(&self, path: &std::path::Path) -> Option<PaneId> {
@@ -875,9 +925,30 @@ impl App {
 			return true;
 		}
 		if key.vk == VK_F1 {
-			self.mode = if self.mode == Mode::Normal { Mode::Insert } else { Mode::Normal };
-			if self.mode != Mode::Normal {
-				self.ime_position(self.hwnd);
+			match self.focused().map(|p| p.owner.clone()) {
+				// The human decides between the AI window's two modes, just as
+				// normal/insert is decided in a window no AI holds.
+				Some(Owner::Agent(agent)) => {
+					if let Some(pane) = self.focused_mut() {
+						pane.owner = Owner::Share(agent);
+					}
+					self.mode = Mode::Insert;
+					self.ime_position(self.hwnd);
+				}
+				Some(Owner::Share(agent)) => {
+					if let Some(pane) = self.focused_mut() {
+						pane.owner = Owner::Agent(agent);
+					}
+					self.mode = Mode::Normal;
+				}
+				_ => {
+					if self.mode == Mode::Normal {
+						self.mode = Mode::Insert;
+						self.ime_position(self.hwnd);
+					} else {
+						self.mode = Mode::Normal;
+					}
+				}
 			}
 			return true;
 		}
@@ -896,6 +967,16 @@ impl App {
 				}
 				0x56 => {
 					self.paste();
+					return true;
+				}
+				0x53 => {
+					if let Some(pane) = self.focused_mut() {
+						if let Body::Solid(editor) = &mut pane.body {
+							if let Err(err) = editor.save() {
+								editor.status = format!("保存失败：{err}");
+							}
+						}
+					}
 					return true;
 				}
 				0x25 => {
@@ -923,6 +1004,17 @@ impl App {
 				return true;
 			}
 			0x0D => {
+				// In an AI window the typing mode is share, just as insert is the
+				// typing mode elsewhere.
+				match self.focused().map(|p| p.owner.clone()) {
+					Some(Owner::Agent(agent)) => {
+						if let Some(pane) = self.focused_mut() {
+							pane.owner = Owner::Share(agent);
+						}
+					}
+					Some(Owner::Share(_)) => return true,
+					_ => {}
+				}
 				self.mode = Mode::Insert;
 				self.ime_position(self.hwnd);
 				return true;
@@ -982,6 +1074,15 @@ impl App {
 			'g' => {
 				self.open_group();
 			}
+			'i' => {
+				if let Some(Owner::Agent(agent)) = self.focused().map(|p| p.owner.clone()) {
+					if let Some(pane) = self.focused_mut() {
+						pane.owner = Owner::Share(agent);
+					}
+					self.mode = Mode::Insert;
+					self.ime_position(self.hwnd);
+				}
+			}
 			'1'..='9' => {
 				let index = (ch as u8 - b'1') as usize;
 				if index < self.tabs.len() {
@@ -1007,8 +1108,21 @@ impl App {
 		if key.ctrl && !key.alt {
 			match key.vk {
 				0x56 => {
-					self.paste();
+					if !self.paste() && kind == 0 {
+						self.forward_key(key);
+					}
 					return true;
+				}
+				// As in any terminal: with text selected Ctrl+C copies it, without a selection
+				// it is the interrupt character for the program in the pane.
+				0x43 if kind == 0 => {
+					let selected = self.focused().is_some_and(|pane| {
+						matches!(&pane.body, Body::Term(term) if term.selection.is_some())
+					});
+					if selected {
+						self.copy_selection();
+						return true;
+					}
 				}
 				_ => {}
 			}
@@ -1166,7 +1280,8 @@ impl App {
 				if term.exited {
 					return;
 				}
-				if key.down {
+				// Modifier presses alone are not typing; they must not drop a selection.
+				if key.down && !is_modifier(key.vk) {
 					term.selection = None;
 				}
 				let modes = term.screen.modes;
@@ -1265,19 +1380,21 @@ impl App {
 		}
 	}
 
-	fn paste(&mut self) {
-		let Some(pane) = self.focused() else { return };
+	fn paste(&mut self) -> bool {
+		let Some(pane) = self.focused() else { return false };
 		if let Owner::Agent(_) = pane.owner {
-			return;
+			return false;
 		}
-		let text = clipboard_text().or_else(|| clipboard_image_path().map(|path| format!("{path} ")));
-		let Some(text) = text else { return };
-		let Some(pane) = self.focused_mut() else { return };
+		let text = clipboard_text().filter(|text| !text.is_empty())
+			.or_else(|| clipboard_image_path().map(|path| format!("{path} ")));
+		let Some(text) = text else { return false };
+		let Some(pane) = self.focused_mut() else { return false };
 		match &mut pane.body {
 			Body::Term(term) => term.paste(&text),
 			Body::Solid(editor) => editor.paste(&text),
 			Body::Even(group) => group.insert_text(&text),
 		}
+		true
 	}
 
 	fn insert_text(&mut self, text: &str) {
@@ -1381,14 +1498,16 @@ impl App {
 				let row = editor.cursor.0.saturating_sub(editor.scroll);
 				let mut visual = 0usize;
 				for c in editor.lines[editor.cursor.0].iter().take(editor.cursor.1) {
-					visual += if *c == '\t' { 4 - visual % 4 } else { 1 };
+					visual += if *c == '\t' { 4 - visual % 4 } else { crate::solid::char_cells(*c) };
 				}
 				let col = visual.saturating_sub(editor.hscroll);
 				Some((rect.left + col as i32 * cw, rect.top + row as i32 * ch))
 			}
-			Body::Even(_) => {
-				let rows = (rect.height() / ch).max(1);
-				Some((rect.left + 2 * cw, rect.top + (rows - 1) * ch))
+			Body::Even(group) => {
+				let cols = (rect.width() / cw).max(1) as usize;
+				let rows = (rect.height() / ch).max(1) as usize;
+				let (col, row) = group.caret_cell(cols, rows);
+				Some((rect.left + col as i32 * cw, rect.top + row as i32 * ch))
 			}
 		}
 	}
@@ -1415,11 +1534,22 @@ impl App {
 
 	fn mouse_down(&mut self, x: i32, y: i32) {
 		let Some(id) = self.mouse_target(x, y) else { return };
+		let already_focused = self.focused_id() == Some(id);
 		self.focus_pane(id);
-		// Scroll mode is for reading history and copying; a click there must not
-		// leave the text mode in a half state where typing is still swallowed.
+		// Five window modes. Clicking into an AI window from outside always lands
+		// in agent, the way a plain window lands in normal; clicking inside the
+		// share window keeps the human typing.
 		if !self.scroll_mode {
-			self.mode = Mode::Insert;
+			match self.pane(id).map(|p| p.owner.clone()) {
+				Some(Owner::Share(_)) if already_focused => self.mode = Mode::Insert,
+				Some(Owner::Share(agent)) => {
+					if let Some(pane) = self.pane_mut(id) {
+						pane.owner = Owner::Agent(agent);
+					}
+					self.mode = Mode::Normal;
+				}
+				_ => self.mode = Mode::Normal,
+			}
 		}
 		if let Some(pane) = self.pane_mut(id) {
 			pane.ai_created = false;
@@ -1631,7 +1761,33 @@ impl App {
 		true
 	}
 
+	fn request_close_app(&mut self) {
+		if let Some(event) = self.events.first() {
+			self.modal = Some(Modal::Events { pane: event.pane });
+			return;
+		}
+		for pane in self.tabs.iter().flat_map(|tab| tab.panes.values()) {
+			if let Owner::Agent(agent) | Owner::Share(agent) = &pane.owner {
+				self.modal = Some(Modal::CloseAgent { pane: pane.id, agent: agent.clone() });
+				return;
+			}
+			if let Body::Solid(editor) = &pane.body {
+				if editor.modified {
+					let id = pane.id;
+					self.focus_pane_anywhere(id);
+					self.modal = Some(Modal::Notice(String::from("文件尚未保存，窗口没有关闭。先在 solid 按 Ctrl+S 保存。")));
+					return;
+				}
+			}
+		}
+		unsafe { DestroyWindow(self.hwnd); }
+	}
+
 	fn request_close_pane(&mut self, id: PaneId) {
+		if self.pane(id).is_some_and(|pane| matches!(&pane.body, Body::Solid(editor) if editor.modified)) {
+			self.modal = Some(Modal::Notice(String::from("文件尚未保存，窗口没有关闭。先在 solid 按 Ctrl+S 保存。")));
+			return;
+		}
 		if self.events.iter().any(|e| e.pane == id) {
 			self.modal = Some(Modal::Events { pane: id });
 			return;
@@ -1648,6 +1804,13 @@ impl App {
 
 	fn request_close_tab(&mut self) {
 		let Some(tab) = self.tabs.get(self.active) else { return };
+		if let Some(id) = tab.panes.values().find_map(|pane| {
+			matches!(&pane.body, Body::Solid(editor) if editor.modified).then_some(pane.id)
+		}) {
+			self.focus_pane_anywhere(id);
+			self.modal = Some(Modal::Notice(String::from("标签中有文件尚未保存，没有关闭。先在 solid 按 Ctrl+S 保存。")));
+			return;
+		}
 		if let Some(event) = self.events.iter().find(|e| tab.panes.contains_key(&e.pane)) {
 			let pane = event.pane;
 			self.modal = Some(Modal::Events { pane });
@@ -1778,21 +1941,33 @@ impl App {
 		if let Some(p) = self.pane_mut(pane) {
 			if matches!(p.owner, Owner::Agent(_) | Owner::Share(_)) {
 				p.owner = Owner::Normal;
-				p.seen = true;
+				p.seen = false;
 			}
 		}
 	}
 
 	fn stop_event(&mut self, id: u64) {
 		let Some(event) = self.events.iter().find(|e| e.id == id).cloned() else { return };
-		self.events.retain(|e| e.id != id);
-		if event.kind == EventKind::AiTask {
-			if let Some(pane) = self.pane(event.pane) {
-				if let Body::Even(group) = &pane.body {
+		if let Some(pane) = self.pane(event.pane) {
+			match &pane.body {
+				Body::Even(group) => {
 					group.stop(event.member.as_deref());
+					return;
 				}
+				Body::Term(term) if !term.process_exited() => {
+					term.write(b"\x03");
+					if let Some(pty) = &term.pty {
+						pty.interrupt();
+					}
+					if let Some(event) = self.events.iter_mut().find(|e| e.id == id) {
+						event.label = String::from("已请求中断，等待终端命令结束");
+					}
+					return;
+				}
+				_ => {}
 			}
 		}
+		self.events.retain(|e| e.id != id);
 		self.clear_owner_if_idle(event.pane);
 	}
 
@@ -1812,10 +1987,51 @@ impl App {
 				EvenEvent::OpenPage { name, session } => {
 					self.open_member_page(pane, group, &name, &session);
 				}
+				EvenEvent::Stopping { name } => {
+					if let Some(Pane { body: Body::Even(group), .. }) = self.pane(pane) {
+						let agent = format!("{}:{name}", group.name);
+						self.cancel_takeovers(&agent);
+					}
+				}
+				EvenEvent::Stopped { name } => {
+					if let Some(Pane { body: Body::Even(group), .. }) = self.pane(pane) {
+						let agent = format!("{}:{name}", group.name);
+						self.release_agent(&agent);
+					}
+				}
 				EvenEvent::ClosePage { name } => {
 					self.close_member_page(group, &name);
 				}
 			}
+		}
+	}
+
+	fn cancel_takeovers(&mut self, agent: &str) {
+		let requests = std::mem::take(&mut self.pending_takeovers);
+		for request in requests {
+			if request.agent == agent {
+				request.cancelled.store(true, std::sync::atomic::Ordering::Release);
+				let _ = request.reply.send(Err(String::from("成员已请求停止，未执行接管操作")));
+			} else {
+				self.pending_takeovers.push(request);
+			}
+		}
+	}
+
+	fn release_agent(&mut self, agent: &str) {
+		self.cancel_takeovers(agent);
+		self.auth.retain(|(_, owner), _| owner != agent);
+		let events: Vec<u64> = self.events.iter()
+			.filter(|event| event.member.as_deref() == Some(agent))
+			.map(|event| event.id).collect();
+		for id in events {
+			self.stop_event(id);
+		}
+		let panes: Vec<PaneId> = self.tabs.iter().flat_map(|tab| tab.panes.values())
+			.filter(|pane| matches!(&pane.owner, Owner::Agent(owner) if owner == agent))
+			.map(|pane| pane.id).collect();
+		for id in panes {
+			self.clear_owner_if_idle(id);
 		}
 	}
 
@@ -1936,8 +2152,82 @@ impl App {
 			}
 			None => Vec::new(),
 		};
-		for request in requests {
+		for mut request in requests {
+			if let Some(session) = &request.session {
+				let Some(agent) = self.session_agent(session) else {
+					let _ = request.reply.send(Err(String::from("这个 even 成员正在停止或已经不存在")));
+					continue;
+				};
+				request.agent = agent;
+			}
+			if !request.is_active() {
+				continue;
+			}
+			if matches!(request.tool.as_str(), "write_window" | "run_in_terminal") {
+				if let Ok(id) = self.parse_id(&request.args) {
+					if self.needs_takeover(id, &request.agent) {
+						self.pending_takeovers.push(request);
+						continue;
+					}
+				}
+			}
 			let result = self.mcp_tool(&request.tool, &request.args, &request.agent);
+			let _ = request.reply.send(result);
+		}
+		self.pending_takeovers.retain(|request| request.is_active());
+		if let Some(Modal::Takeover { pane, agent }) = &self.modal {
+			if !self.pending_takeovers.iter().any(|r| r.args["id"].as_u64() == Some(*pane as u64) && r.agent == *agent) {
+				self.modal = None;
+			}
+		}
+		if self.modal.is_none() {
+			if let Some(request) = self.pending_takeovers.first() {
+				if let Ok(pane) = self.parse_id(&request.args) {
+					self.modal = Some(Modal::Takeover { pane, agent: request.agent.clone() });
+				}
+			}
+		}
+	}
+
+	fn session_agent(&self, session: &str) -> Option<String> {
+		self.tabs.iter().flat_map(|tab| tab.panes.values()).find_map(|pane| {
+			let Body::Even(group) = &pane.body else { return None };
+			if !group.session_can_act(session) {
+				return None;
+			}
+			group.member_sessions().into_iter()
+				.find(|(_, id)| id == session)
+				.map(|(name, _)| format!("{}:{name}", group.name))
+		})
+	}
+
+	fn needs_takeover(&self, id: PaneId, agent: &str) -> bool {
+		self.pane(id).is_some_and(|pane| {
+			pane.owner == Owner::Normal
+				&& !self.auth.contains_key(&(id, agent.to_string()))
+				&& (pane.seen || pane.creator.as_deref().is_some_and(|creator| creator != agent))
+		})
+	}
+
+	fn answer_takeover(&mut self, pane: PaneId, agent: &str, approved: bool) {
+		let requests = std::mem::take(&mut self.pending_takeovers);
+		for request in requests {
+			if request.args["id"].as_u64() != Some(pane as u64) || request.agent != agent {
+				self.pending_takeovers.push(request);
+				continue;
+			}
+			let result = if !request.is_active() {
+				Err(String::from("接管请求已过期，没有执行"))
+			} else if request.session.as_ref().is_some_and(|session| self.session_agent(session).is_none()) {
+				Err(String::from("这个 even 成员正在停止或已经不存在"))
+			} else if !approved {
+				Err(String::from("人拒绝了接管，没有执行；不要重试或改用其他窗口绕过拒绝。"))
+			} else if self.pane(pane).is_none_or(|p| p.owner != Owner::Normal && p.owner != Owner::Agent(agent.to_string())) {
+				Err(String::from("窗口已经关闭或归属已改变，没有执行"))
+			} else {
+				self.grant_agent(pane, agent)
+					.and_then(|()| self.mcp_tool(&request.tool, &request.args, agent))
+			};
 			let _ = request.reply.send(result);
 		}
 	}
@@ -1949,6 +2239,8 @@ impl App {
 	fn mcp_tool(&mut self, tool: &str, args: &Value, agent: &str) -> Result<Value, String> {
 		match tool {
 			"list_windows" => {
+				let cols = (self.width / self.canvas.cell_w.max(1)).max(1);
+				let rows = ((self.height - self.canvas.cell_h).max(1) / self.canvas.cell_h.max(1)).max(1);
 				let mut tabs = Vec::new();
 				for (index, tab) in self.tabs.iter().enumerate() {
 					let mut panes = Vec::new();
@@ -1972,7 +2264,7 @@ impl App {
 					}
 					tabs.push(json!({"tab": index + 1, "active": index == self.active, "panes": panes}));
 				}
-				Ok(json!({"text": serde_json::to_string_pretty(&json!({"tabs": tabs})).unwrap_or_default()}))
+				Ok(json!({"text": serde_json::to_string_pretty(&json!({"cols": cols, "rows": rows, "tabs": tabs})).unwrap_or_default()}))
 			}
 			"read_window" => {
 				let id = self.parse_id(args)?;
@@ -1991,7 +2283,8 @@ impl App {
 				let Some(pane) = self.pane_mut(id) else { return Err(format!("没有窗口 {id}")) };
 				let Body::Solid(editor) = &mut pane.body else { return Err(String::from("这个窗口不是 solid")) };
 				editor.replace_all(text);
-				Ok(json!({"text": format!("已写入窗口 {id}")}))
+				editor.save().map_err(|err| format!("窗口内容已更新但文件保存失败：{err}"))?;
+				Ok(json!({"text": format!("已写入窗口 {id} 并保存文件")}))
 			}
 			"run_in_terminal" => {
 				let id = self.parse_id(args)?;
@@ -2031,8 +2324,7 @@ impl App {
 						if let Some(id) = self.find_solid(&path) {
 							return Ok(json!({"text": format!("窗口 {id} 已经打开这个文件")}));
 						}
-						let content = if path.is_file() { std::fs::read_to_string(&path).unwrap_or_default() } else { String::new() };
-						let editor = Editor::new(path, content, false);
+						let editor = Editor::open(path, false).map_err(|err| format!("文件没有打开：{err}"))?;
 						let id = self.next_pane;
 						self.next_pane += 1;
 						self.insert_pane(tab, id, Body::Solid(editor), Owner::Normal, true, 0, None, false, None);
@@ -2073,6 +2365,9 @@ impl App {
 					return Err(format!("窗口 {id} 绑着事件，不能关：{}", list.join("；")));
 				}
 				let Some(pane) = self.pane(id) else { return Err(format!("没有窗口 {id}")) };
+				if matches!(&pane.body, Body::Solid(editor) if editor.modified) {
+					return Err(String::from("文件尚未保存，不能关闭"));
+				}
 				let owned = matches!(&pane.owner, Owner::Agent(a) if a == agent);
 				let mine = pane.creator.as_deref() == Some(agent);
 				if !owned && !mine && !self.auth.contains_key(&(id, agent.to_string())) {
@@ -2094,8 +2389,14 @@ impl App {
 				if !self.events.iter().any(|e| e.id == id) {
 					return Err(format!("没有事件 {id}"));
 				}
+				let event = self.events.iter().find(|e| e.id == id).unwrap();
+				let pane = self.pane(event.pane).ok_or_else(|| String::from("窗口已关闭"))?;
+				if !matches!(&pane.owner, Owner::Agent(owner) if owner == agent)
+					&& event.member.as_deref() != Some(agent) {
+					return Err(String::from("不能停止其他成员或人的任务"));
+				}
 				self.stop_event(id);
-				Ok(json!({"text": format!("已停止事件 {id}")}))
+				Ok(json!({"text": format!("已请求停止事件 {id}；以 list_events 和 read_window 的实际结果为准")}))
 			}
 			"takeover_status" => {
 				let id = self.parse_id(args)?;
@@ -2125,7 +2426,8 @@ impl App {
 			return Err(format!("没有窗口 {id}"));
 		};
 		match &owner {
-			Owner::Agent(owner) if owner == agent => return Ok(()),
+			// The human decides agent or share; the agent keeps working in either.
+			Owner::Agent(owner) | Owner::Share(owner) if owner == agent => return Ok(()),
 			Owner::Agent(owner) | Owner::Share(owner) => {
 				return Err(format!("窗口 {id} 属于 {owner}"));
 			}
@@ -2135,20 +2437,22 @@ impl App {
 		let mine = creator.as_deref() == Some(agent);
 		let needs_request = seen || (creator.is_some() && !mine);
 		if !needs_request || authorized {
-			self.grant_agent(id, agent);
-			return Ok(());
+			return self.grant_agent(id, agent);
 		}
-		if !matches!(self.modal, Some(Modal::Takeover { pane, .. }) if pane == id) {
-			self.modal = Some(Modal::Takeover { pane: id, agent: agent.to_string() });
-		}
-		Err(format!("需要人批准：接管窗口 {id} 的请求已显示在窗口里，等人按 a；批准后重试本操作。"))
+		Err(format!("接管窗口 {id} 需要人批准，没有执行。"))
 	}
 
-	fn grant_agent(&mut self, id: PaneId, agent: &str) {
-		if let Some(pane) = self.pane_mut(id) {
-			pane.owner = Owner::Agent(agent.to_string());
+	fn grant_agent(&mut self, id: PaneId, agent: &str) -> Result<(), String> {
+		let pane = self.pane_mut(id).ok_or_else(|| format!("没有窗口 {id}"))?;
+		if let Body::Solid(editor) = &mut pane.body {
+			if editor.modified {
+				editor.save().map_err(|err| format!("接管前保存失败，没有交给 AI：{err}"))?;
+			}
 		}
+		pane.owner = Owner::Agent(agent.to_string());
+		pane.seen = false;
 		self.auth.insert((id, agent.to_string()), ());
+		Ok(())
 	}
 
 	fn prune_ai_panes(&mut self) {
@@ -2162,8 +2466,7 @@ impl App {
 					&& !self.events.iter().any(|e| e.pane == p.id)
 					&& match &p.body {
 						Body::Solid(editor) => !editor.ever_modified(),
-						Body::Term(_) => true,
-						Body::Even(_) => false,
+						Body::Term(_) | Body::Even(_) => false,
 					}
 			})
 			.map(|p| p.id)
@@ -2176,7 +2479,11 @@ impl App {
 
 	fn modal_key(&mut self, key: &Key) {
 		if key.vk == VK_ESCAPE {
-			self.modal = None;
+			if let Some(Modal::Takeover { pane, agent }) = self.modal.take() {
+				self.answer_takeover(pane, &agent, false);
+			} else {
+				self.modal = None;
+			}
 			return;
 		}
 		let modal = self.modal.take();
@@ -2201,23 +2508,13 @@ impl App {
 				}
 			}
 			Some(Modal::Takeover { pane, agent }) => match key.ch {
-				Some('a') => {
-					self.grant_agent(pane, &agent);
-				}
-				Some('r') => {}
+				Some('a') => self.answer_takeover(pane, &agent, true),
+				Some('r') => self.answer_takeover(pane, &agent, false),
 				_ => self.modal = Some(Modal::Takeover { pane, agent }),
 			},
 			Some(Modal::CloseAgent { pane, agent }) => {
 				if key.ch == Some('s') {
 					self.stop_events_for(pane);
-					if let Some(p) = self.pane_mut(pane) {
-						if let Owner::Agent(a) | Owner::Share(a) = &p.owner {
-							if a == &agent {
-								p.owner = Owner::Normal;
-								p.seen = true;
-							}
-						}
-					}
 				} else {
 					self.modal = Some(Modal::CloseAgent { pane, agent });
 				}
@@ -2242,8 +2539,8 @@ impl App {
 						String::from("鼠标：拖动选择；普通模式下 Ctrl+C 复制；终端要鼠标时按 Shift 拖动仍可选中"),
 						String::from("接管：读窗口不用申请；写入/接管要窗口归属或人批准；批准会记住"),
 						String::from("关闭：有任务事件时拒绝并列出；AI 的窗口先停止任务"),
-						String::from("odd：终端里运行 odd；solid 用 e；even 用 g"),
-						String::from("solid 开别的文件：fish 里 $SOLID \"<文件>\"，odd 里 %SOLID% \"<文件>\"（路径要加引号，否则 fish 会吃掉反斜杠；等同 --file），或再启动一次 --file"),
+						String::from("odd：默认终端就是 odd 本身，不用切换 shell；solid 用 e；even 用 g"),
+						String::from("solid：终端里 \"$SOLID\" <文件>；启动 Delta 时带 <文件>；已经运行时在现有窗口打开"),
 						String::from("终端里 Ctrl+C 原样送程序；solid 里 Ctrl+C 复制、Ctrl+S 保存"),
 						format!("Delta MCP：{mcp}"),
 					],
@@ -2260,15 +2557,15 @@ impl App {
 			Some(Modal::Takeover { pane, agent }) => (
 				String::from("接管请求"),
 				vec![
-					format!("{agent} 想接管窗口 {pane}。"),
+					format!("{} 想接管窗口 {pane}。", agent_badge(agent)),
 					String::from("a 同意；r 拒绝；Esc 拒绝"),
-					String::from("同意后这次运行里记住（窗口 + AI）；重开 Delta 要重新申请。"),
+					String::from("同意后自动继续；你再次在前台输入过，下一次接管会重新申请。"),
 				],
 			),
 			Some(Modal::CloseAgent { pane, agent }) => (
 				String::from("AI 的窗口"),
 				vec![
-					format!("窗口 {pane} 属于 {agent}。"),
+					format!("窗口 {pane} 属于 {}。", agent_badge(agent)),
 					String::from("s 停止它的任务（窗口留给你）"),
 					String::from("Esc 关闭本框"),
 				],
@@ -2316,17 +2613,48 @@ impl App {
 			for (id, rect) in &rects {
 				let Some(pane) = self.tabs[active].panes.get(id) else { continue };
 				let focused = *id == focus;
-				let color = if focused {
+				// A pane an AI is holding keeps its owner colour whether or not it is
+				// focused; the inner line carries the focus instead.
+				let held_by_ai = matches!(&pane.owner, Owner::Agent(_) | Owner::Share(_));
+				let color = if focused && !held_by_ai {
 					canvas::rgb(canvas::BORDER_ACTIVE.0, canvas::BORDER_ACTIVE.1, canvas::BORDER_ACTIVE.2)
 				} else {
 					owner_color(&pane.owner)
 				};
-				self.canvas.outline(rect.left, rect.top, rect.right - 1, rect.bottom - 1, color);
+				if held_by_ai {
+					// A 1-pixel line disappears on the dark background; an unfocused AI
+					// pane must still show whose it is, so the owner band is 3 pixels.
+					self.canvas.fill(rect.left, rect.top, rect.right, rect.top + 3, color);
+					self.canvas.fill(rect.left, rect.bottom - 3, rect.right, rect.bottom, color);
+					self.canvas.fill(rect.left, rect.top, rect.left + 3, rect.bottom, color);
+					self.canvas.fill(rect.right - 3, rect.top, rect.right, rect.bottom, color);
+				} else {
+					self.canvas.outline(rect.left, rect.top, rect.right - 1, rect.bottom - 1, color);
+				}
+				if focused && held_by_ai {
+					// The owner band says who holds the pane, the inner line says it still
+					// has the keyboard focus.
+					let accent = canvas::rgb(canvas::BORDER_ACTIVE.0, canvas::BORDER_ACTIVE.1, canvas::BORDER_ACTIVE.2);
+					self.canvas.outline(rect.left + 4, rect.top + 4, rect.right - 5, rect.bottom - 5, accent);
+				}
 				if self.show_numbers {
 					let label = format!(" {} ", id);
 					let width = label.len() as i32 * cw;
 					self.canvas.fill(rect.left, rect.top, rect.left + width, rect.top + ch, canvas::rgb(60, 70, 90));
 					self.canvas.text(rect.left, rect.top, &label, canvas::rgb(240, 240, 240));
+				}
+				if held_by_ai {
+					let label = match &pane.owner {
+						Owner::Agent(agent) => format!(" agent {} ", agent_badge(agent)),
+						Owner::Share(agent) => format!(" share {} ", agent_badge(agent)),
+						Owner::Normal => String::new(),
+					};
+					let room = ((rect.right - rect.left) / cw.max(1)).max(1) as usize;
+					let label = clip_text(&label, room);
+					let width = label.width() as i32 * cw;
+					let x = (rect.right - width).max(rect.left);
+					self.canvas.fill(x, rect.top, rect.right, rect.top + ch, color);
+					self.canvas.text(x, rect.top, &label, canvas::rgb(20, 16, 26));
 				}
 			}
 		}
@@ -2365,26 +2693,44 @@ impl App {
 			x += width;
 		}
 		let pane = self.focused();
-		let owner = pane.map(|p| owner_label(&p.owner)).unwrap_or_else(|| String::from("normal"));
-		let mode = if self.scroll_mode {
-			"SCROLL"
-		} else {
-			match self.mode {
-				Mode::Normal => "NORMAL",
-				Mode::Insert => "INSERT",
-				Mode::Replace => "REPLACE",
-			}
+		// The mode field holds one of five window modes: normal, insert, replace,
+		// agent, share. Agent and share belong to the AI and carry its name.
+		let owner_mode = pane.and_then(|p| match &p.owner {
+			Owner::Agent(agent) => Some((format!("agent {}", agent_badge(agent)), owner_color(&p.owner))),
+			Owner::Share(agent) => Some((format!("share {}", agent_badge(agent)), owner_color(&p.owner))),
+			Owner::Normal => None,
+		});
+		let (mode_label, mode_color) = match (owner_mode, self.scroll_mode) {
+			(Some((label, color)), _) => (label, Some(color)),
+			(None, true) => (String::from("SCROLL"), None),
+			(None, false) => (
+				String::from(match self.mode {
+					Mode::Normal => "NORMAL",
+					Mode::Insert => "INSERT",
+					Mode::Replace => "REPLACE",
+				}),
+				None,
+			),
 		};
 		let zoom = self.tabs.get(self.active).map(|t| t.zoom).unwrap_or(false);
-		let right = format!(
-			"{mode}  {owner}  tab {}/{}  pane {}{} ",
+		let prefix = format!("{mode_label}  ");
+		let tail = format!(
+			"tab {}/{}  pane {}{} ",
 			self.active + 1,
 			self.tabs.len(),
 			self.focused_id().unwrap_or(0),
 			if zoom { "  ZOOM" } else { "" }
 		);
+		let right = format!("{prefix}{tail}");
 		let width = right.width() as i32 * cw;
-		self.canvas.text((self.width - width - 4).max(0), y, &right, canvas::rgb(canvas::ACCENT.0, canvas::ACCENT.1, canvas::ACCENT.2));
+		let x = (self.width - width - 4).max(0);
+		let accent = canvas::rgb(canvas::ACCENT.0, canvas::ACCENT.1, canvas::ACCENT.2);
+		self.canvas.text(x, y, &right, accent);
+		if let Some(color) = mode_color {
+			let label_w = mode_label.width() as i32 * cw;
+			self.canvas.fill(x, y, x + label_w, y + ch, color);
+			self.canvas.text(x, y, &mode_label, canvas::rgb(20, 16, 26));
+		}
 	}
 
 	fn draw_modal(&mut self) {
@@ -2428,46 +2774,10 @@ unsafe fn forward_open(hwnd: HWND, path: &std::path::Path) -> bool {
 }
 
 fn default_shell() -> String {
-	// fish is the shell; odd and cmd remain as fallbacks.
-	let exe_dir = std::env::current_exe()
+	std::env::current_exe()
 		.ok()
-		.and_then(|exe| exe.parent().map(|dir| dir.to_path_buf()));
-	if let Some(dir) = &exe_dir {
-		let fish = dir.join("fish.exe");
-		if fish.is_file() {
-			return fish.to_string_lossy().into_owned();
-		}
-	}
-	if let Ok(path) = std::env::var("PATH") {
-		for dir in std::env::split_paths(&path) {
-			let fish = dir.join("fish.exe");
-			if fish.is_file() {
-				return fish.to_string_lossy().into_owned();
-			}
-		}
-	}
-	// Running from this repository's target/debug: fish builds into its own target directory.
-	if let Some(dir) = &exe_dir {
-		let fish = dir.join("../../fish/target/debug/fish.exe");
-		if fish.is_file() {
-			return fish.to_string_lossy().into_owned();
-		}
-	}
-	if let Some(dir) = &exe_dir {
-		let odd = dir.join("odd.exe");
-		if odd.is_file() {
-			return odd.to_string_lossy().into_owned();
-		}
-	}
-	if let Ok(path) = std::env::var("PATH") {
-		for dir in std::env::split_paths(&path) {
-			let odd = dir.join("odd.exe");
-			if odd.is_file() {
-				return odd.to_string_lossy().into_owned();
-			}
-		}
-	}
-	std::env::var("COMSPEC").unwrap_or_else(|_| String::from("cmd.exe"))
+		.and_then(|exe| exe.parent().map(|dir| format!("\"{}\"", dir.join("odd.exe").display())))
+		.unwrap_or_else(|| String::from("odd.exe"))
 }
 
 fn resize_body(body: &mut Body, rect: &Rect, cw: i32, ch: i32) {
@@ -2500,6 +2810,18 @@ fn owner_label(owner: &Owner) -> String {
 		Owner::Agent(agent) => format!("agent:{agent}"),
 		Owner::Share(agent) => format!("share:{agent}"),
 	}
+}
+
+/// `even3:sam` reads `3-sam` on screen.
+fn agent_badge(agent: &str) -> String {
+	match agent.split_once(':') {
+		Some((group, name)) => format!("{}-{name}", group.strip_prefix("even").unwrap_or(group)),
+		None => String::from(agent),
+	}
+}
+
+fn is_modifier(vk: u16) -> bool {
+	matches!(vk, 0x10 | 0x11 | 0x12 | 0x5B | 0x5C | 0xA0..=0xA5)
 }
 
 fn owner_color(owner: &Owner) -> u32 {
@@ -2557,7 +2879,7 @@ fn editor_col_at(editor: &Editor, row: usize, target_cell: usize) -> usize {
 		if cell >= target_cell {
 			return index;
 		}
-		cell += if *ch == '\t' { 4 - cell % 4 } else { 1 };
+		cell += if *ch == '\t' { 4 - cell % 4 } else { crate::solid::char_cells(*ch) };
 	}
 	line.len()
 }

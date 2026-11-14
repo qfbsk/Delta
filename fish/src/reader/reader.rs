@@ -399,12 +399,12 @@ pub fn reader_push<'a>(
         handle_emoji_width(parser.vars());
 
         // Provide value for `status current-command`
-        parser.libdata_mut().status_vars.command = L!("fish").to_owned();
+        parser.libdata_mut().status_vars.command = L!("odd").to_owned();
         // Also provide a value for the deprecated fish 2.0 $_ variable
         parser.set_one(
             L!("_"),
             ParserEnvSetMode::new(EnvMode::GLOBAL),
-            L!("fish").to_owned(),
+            L!("odd").to_owned(),
         );
         assert!(parser.blocking_query_timeout.is_none());
         parser.blocking_query_timeout = input_data.blocking_query_timeout;

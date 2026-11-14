@@ -205,7 +205,19 @@ fn build_command_line(argv: &[WString]) -> Vec<u16> {
             line.push(u16::from(b' '));
         }
         let os = wcs2osstring(arg);
-        let wide: Vec<u16> = os.encode_wide().collect();
+        let mut wide: Vec<u16> = os.encode_wide().collect();
+        if i == 0 {
+            // cmd.exe (and some other programs) parse their own argv0 and misread a
+            // drive path written with forward slashes, e.g. C:/Windows/System32/cmd.exe.
+            // argv0 is only a name for the program, so hand it native separators.
+            if wide.contains(&u16::from(b'/')) {
+                for unit in wide.iter_mut() {
+                    if *unit == u16::from(b'/') {
+                        *unit = u16::from(b'\\');
+                    }
+                }
+            }
+        }
         append_quoted_arg(&mut line, &wide);
     }
     line.push(0);

@@ -1,5 +1,6 @@
 [workspace]
 members = ["crates/delta-vt", "crates/delta-term", "crates/delta-odd"]
+exclude = ["fish"]
 resolver = "2"
 
 [profile.release]

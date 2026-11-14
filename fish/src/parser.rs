@@ -1172,7 +1172,7 @@ impl Parser {
                 user_presentable_path(&filename, self.vars())
             }
         } else {
-            L!("fish").to_owned()
+            L!("odd").to_owned()
         };
 
         let mut output = err.describe_with_prefix(src, &prefix, self.is_interactive(), skip_caret);

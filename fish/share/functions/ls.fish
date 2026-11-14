@@ -1,5 +1,13 @@
 # localization: skip(uses-apropos)
 function ls
+    # odd ships a native ls builtin; a plain Windows machine has no coreutils.
+    # `command ls` always means an external program, so hand over to the builtin
+    # when there is nothing in PATH.
+    if not command -sq ls
+        builtin ls $argv
+        return
+    end
+
     # Make ls use colors and show indicators if we are on a system that supports that feature and writing to stdout.
     #
 

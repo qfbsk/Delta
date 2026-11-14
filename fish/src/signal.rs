@@ -170,12 +170,20 @@ fn console_input_processed() -> bool {
 /// ENABLE_PROCESSED_INPUT and get the key as an ordinary byte on stdin instead.
 #[cfg(windows)]
 fn watch_delta_interrupts() {
+    use crate::env::{EnvMode, EnvSetMode, EnvStack, unsetenv_lock};
     use std::io::Read as _;
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let Ok(name) = std::env::var("DELTA_CTRL") else {
             return;
         };
+        // This pipe belongs to this shell alone. Drop the name before any child is started,
+        // otherwise a nested shell or script inherits it and fails to open the same pipe.
+        let _ = EnvStack::globals().remove(
+            L!("DELTA_CTRL"),
+            EnvSetMode::new_at_early_startup(EnvMode::GLOBAL_EXPORTED),
+        );
+        unsetenv_lock(L!("DELTA_CTRL"));
         std::thread::spawn(move || {
             let Ok(mut pipe) = std::fs::OpenOptions::new().read(true).open(&name) else {
                 flog!(error, "could not open DELTA_CTRL pipe:", name);

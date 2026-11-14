@@ -4,6 +4,7 @@
 use std::path::PathBuf;
 
 use tree_sitter::Parser;
+use unicode_width::UnicodeWidthChar;
 
 use crate::canvas::{self, Canvas};
 use crate::layout::Rect;
@@ -85,6 +86,15 @@ pub struct Editor {
 }
 
 impl Editor {
+	pub fn open(path: PathBuf, read_only: bool) -> std::io::Result<Self> {
+		let content = match std::fs::read_to_string(&path) {
+			Ok(content) => content,
+			Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+			Err(err) => return Err(err),
+		};
+		Ok(Self::new(path, content, read_only))
+	}
+
 	pub fn new(path: PathBuf, content: String, read_only: bool) -> Self {
 		let mut lines: Vec<Vec<char>> = content.split('\n').map(|l| l.chars().collect()).collect();
 		if lines.is_empty() {
@@ -190,6 +200,8 @@ impl Editor {
 		if let Some((lines, cursor)) = self.undo.pop() {
 			self.redo.push((std::mem::replace(&mut self.lines, lines), self.cursor));
 			self.cursor = cursor;
+			self.anchor = None;
+			self.column_goal = None;
 			self.modified = true;
 			self.hl_dirty = true;
 			self.highlight();
@@ -200,6 +212,8 @@ impl Editor {
 		if let Some((lines, cursor)) = self.redo.pop() {
 			self.undo.push((std::mem::replace(&mut self.lines, lines), self.cursor));
 			self.cursor = cursor;
+			self.anchor = None;
+			self.column_goal = None;
 			self.modified = true;
 			self.hl_dirty = true;
 			self.highlight();
@@ -228,7 +242,7 @@ impl Editor {
 		for row in a.0..=b.0 {
 			let line = &self.lines[row];
 			let from = if row == a.0 { a.1.min(line.len()) } else { 0 };
-			let to = if row == b.0 { (b.1 + 1).min(line.len()) } else { line.len() };
+			let to = if row == b.0 { b.1.min(line.len()) } else { line.len() };
 			out.extend(&line[from..to]);
 			if row != b.0 {
 				out.push('\n');
@@ -279,7 +293,7 @@ impl Editor {
 		let Some((a, b)) = self.selection() else { return false };
 		let (mut ar, mut ac) = a;
 		let (br, mut bc) = b;
-		bc = (bc + 1).min(self.lines[br].len());
+		bc = bc.min(self.lines[br].len());
 		if ar == br {
 			self.lines[ar].drain(ac..bc);
 		} else {
@@ -616,7 +630,7 @@ impl Editor {
 		let mut visual_col = 0usize;
 		for (i, c) in self.lines[self.cursor.0].iter().take(self.cursor.1).enumerate() {
 			let _ = i;
-			visual_col += if *c == '\t' { 4 - visual_col % 4 } else { 1 };
+			visual_col += if *c == '\t' { 4 - visual_col % 4 } else { char_cells(*c) };
 		}
 		if visual_col < self.hscroll {
 			self.hscroll = visual_col;
@@ -647,15 +661,16 @@ impl Editor {
 					if screen_col >= cols {
 						break;
 					}
+					let width = char_cells(*c);
 					let mut fg = fg_plain;
 					let class = self.hl.get(line_idx).and_then(|l| l.get(ci)).copied().unwrap_or(Hl::Plain);
 					fg = hl_color(class, fg_plain);
-					let selected = sel.is_some_and(|(a, b)| (line_idx, ci) >= a && (line_idx, ci) <= b);
+					let selected = sel.is_some_and(|(a, b)| (line_idx, ci) >= a && (line_idx, ci) < b);
 					if selected {
 						canvas.fill(
 							area.left + screen_col as i32 * cw,
 							y,
-							area.left + (screen_col as i32 + 1) * cw,
+							area.left + (screen_col as i32 + width as i32) * cw,
 							y + ch,
 							canvas::rgb(canvas::SELECTION_BG.0, canvas::SELECTION_BG.1, canvas::SELECTION_BG.2),
 						);
@@ -665,7 +680,7 @@ impl Editor {
 						canvas.fill(
 							area.left + screen_col as i32 * cw,
 							y,
-							area.left + (screen_col as i32 + 1) * cw,
+							area.left + (screen_col as i32 + width as i32) * cw,
 							y + ch,
 							canvas::rgb(canvas::ACCENT.0, canvas::ACCENT.1, canvas::ACCENT.2),
 						);
@@ -675,7 +690,7 @@ impl Editor {
 					let s = c.encode_utf8(&mut buf);
 					canvas.text(area.left + screen_col as i32 * cw, y, s, fg);
 				}
-				x_cells += 1;
+				x_cells += char_cells(*c);
 				col = ci;
 			}
 			let _ = col;
@@ -708,8 +723,12 @@ impl Editor {
 	}
 }
 
-fn hl_color(class: Hl, plain: windows_sys::Win32::Foundation::COLORREF) -> windows_sys::Win32::Foundation::COLORREF {
-	match class {
+/// Screen cells one character occupies; tabs are handled by the caller.
+pub fn char_cells(c: char) -> usize {
+	c.width().unwrap_or(1).max(1)
+}
+
+fn hl_color(class: Hl, plain: windows_sys::Win32::Foundation::COLORREF) -> windows_sys::Win32::Foundation::COLORREF {	match class {
 		Hl::Plain => plain,
 		Hl::Keyword => canvas::rgb(198, 146, 220),
 		Hl::String => canvas::rgb(152, 195, 121),
@@ -806,6 +825,34 @@ mod tests {
 		ed.undo();
 		ed.undo();
 		ed.redo();
+	}
+
+	#[test]
+	fn undo_clears_selection_from_removed_line() {
+		let mut ed = editor("a");
+		ed.end(false);
+		ed.split_line();
+		ed.insert('b', false);
+		ed.home(false);
+		ed.end(true);
+		ed.undo();
+		ed.undo();
+		assert_eq!(ed.text(), "a");
+		assert_eq!(ed.copy(), "");
+		ed.redo();
+		assert!(ed.anchor.is_none());
+	}
+
+	#[test]
+	fn shift_selection_excludes_cursor_character() {
+		let mut ed = editor("abc");
+		ed.move_cursor(0, 1, true);
+		assert_eq!(ed.copy(), "a");
+		assert_eq!(ed.cut(), "a");
+		assert_eq!(ed.text(), "bc");
+		ed.undo();
+		assert_eq!(ed.text(), "abc");
+		assert!(ed.anchor.is_none());
 	}
 
 	#[test]

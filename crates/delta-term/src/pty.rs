@@ -21,7 +21,7 @@ use windows_sys::Win32::System::Pipes::{
 	CreateNamedPipeW, CreatePipe, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
 };
 use windows_sys::Win32::System::Threading::{
-	CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
+	CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
 	EXTENDED_STARTUPINFO_PRESENT, GetProcessId, InitializeProcThreadAttributeList,
 	LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION,
 	STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
@@ -289,11 +289,13 @@ impl ConPty {
 			let input_write = input_write as HANDLE;
 			let pid = GetProcessId(process);
 			if pid != 0 {
+				use std::os::windows::process::CommandExt;
 				let _ = std::process::Command::new("taskkill")
 					.args(["/PID", &pid.to_string(), "/T", "/F"])
 					.stdin(std::process::Stdio::null())
 					.stdout(std::process::Stdio::null())
 					.stderr(std::process::Stdio::null())
+					.creation_flags(CREATE_NO_WINDOW)
 					.status();
 			}
 			let _ = TerminateProcess(process, 0);

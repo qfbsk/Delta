@@ -240,7 +240,7 @@ impl TerminalPane {
 						out.push(c.comb);
 					}
 				}
-				if r != b.row {
+				if r != b.row && !row.wrapped {
 					out.push('\n');
 				}
 			}

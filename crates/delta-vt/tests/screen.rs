@@ -9,6 +9,32 @@ fn plain(s: &Screen) -> String {
 }
 
 #[test]
+fn soft_wrap_is_not_a_newline_in_copied_text() {
+	let mut s = screen(5, 3);
+	s.feed(b"abcdefgh");
+	assert_eq!(s.text_between(0, 0, 1, 2), "abcdefgh");
+	assert!(s.all_text().starts_with("abcdefgh\n"));
+	let mut s = screen(5, 3);
+	s.feed(b"ab   cd");
+	assert!(s.all_text().starts_with("ab   cd\n"));
+	let mut s = screen(5, 3);
+	s.feed(b"abc\r\ndef");
+	assert!(s.all_text().starts_with("abc\ndef\n"));
+}
+
+#[test]
+fn fish_command_markers_report_completion() {
+	let mut s = screen(20, 3);
+	s.feed(b"\x1b]133;C;cmdline_url=ls\x1b\\");
+	assert_eq!(s.command_finished, None);
+	s.feed(b"output\x1b]133;D;0\x1b\\");
+	assert_eq!(s.command_finished.take(), Some(0));
+	s.feed(b"\x1b]133;C\x07\x1b]133;D;130\x07");
+	assert_eq!(s.command_finished, Some(130));
+	assert_eq!(s.line_text(0).unwrap(), "output");
+}
+
+#[test]
 fn basic_print_and_crlf() {
 	let mut s = screen(10, 3);
 	s.feed(b"hello\r\nworld");

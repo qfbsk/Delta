@@ -18,6 +18,10 @@ use crate::opencode::{Client, DEFAULT_MODEL, MODEL_CHOICES};
 const CODENAMES: [&str; 12] =
 	["sam", "apple", "pine", "lake", "moss", "river", "stone", "cloud", "ember", "frost", "reef", "dune"];
 
+/// AI-to-AI handoffs allowed after one human message. Members may wake each other and talk
+/// back and forth; the limit only stops the exchange drifting on without the human.
+const AI_EXCHANGE_LIMIT: u32 = 6;
+
 #[derive(Clone, Debug)]
 pub struct Member {
 	pub name: String,
@@ -51,18 +55,15 @@ pub struct Record {
 #[derive(Clone, Debug)]
 pub enum EvenEvent {
 	OpenPage { name: String, session: String },
+	Stopping { name: String },
+	Stopped { name: String },
 	ClosePage { name: String },
 }
 
+#[derive(Clone)]
 struct Task {
-	member: String,
+	session: String,
 	started: Instant,
-}
-
-impl Clone for Task {
-	fn clone(&self) -> Self {
-		Self { member: self.member.clone(), started: self.started }
-	}
 }
 
 struct Group {
@@ -73,7 +74,15 @@ struct Group {
 	cursor: usize,
 	scroll: usize,
 	seen: HashSet<String>,
+	adding: HashSet<String>,
+	stopping: HashSet<String>,
+	// A remove requested during stop shares the same interrupt confirmation.
+	removing: HashSet<String>,
 	total_cost: f64,
+	// AI-to-AI handoffs since the human last spoke, and what was already handed over in this
+	// chain so the same sentence is not delivered twice.
+	ai_round: u32,
+	ai_said: HashSet<(String, String, String)>,
 }
 
 impl Group {
@@ -86,7 +95,12 @@ impl Group {
 			cursor: 0,
 			scroll: 0,
 			seen: HashSet::new(),
+			adding: HashSet::new(),
+			stopping: HashSet::new(),
+			removing: HashSet::new(),
 			total_cost: 0.0,
+			ai_round: 0,
+			ai_said: HashSet::new(),
 		}
 	}
 
@@ -104,11 +118,85 @@ impl Group {
 
 	fn next_name(&self) -> String {
 		for name in CODENAMES {
-			if !self.members.iter().any(|m| m.name == name) {
+			if !self.adding.contains(name) && !self.members.iter().any(|m| m.name == name) {
 				return String::from(name);
 			}
 		}
-		format!("member{}", self.members.len() + 1)
+		(13..)
+			.map(|i| format!("member{i}"))
+			.find(|name| !self.adding.contains(name) && !self.members.iter().any(|m| m.name == *name))
+			.unwrap()
+	}
+
+	fn session_can_act(&self, session: &str) -> bool {
+		!self.stopping.contains(session) && self.members.iter().any(|m| m.session == session)
+	}
+
+	fn stop(&mut self, name: Option<&str>, remove: bool, events: &mut Vec<EvenEvent>) -> Vec<String> {
+		let mut sessions = Vec::new();
+		for member in &self.members {
+			if name.is_some_and(|name| member.name != name) {
+				continue;
+			}
+			if remove {
+				self.removing.insert(member.session.clone());
+			}
+			if self.stopping.insert(member.session.clone()) {
+				events.push(EvenEvent::Stopping { name: member.name.clone() });
+				sessions.push(member.session.clone());
+			}
+		}
+		sessions
+	}
+
+	fn interrupted(&mut self, session: &str, result: Result<(), String>, events: &mut Vec<EvenEvent>) {
+		if !self.stopping.remove(session) {
+			return;
+		}
+		let remove = self.removing.remove(session);
+		let Some(index) = self.members.iter().position(|m| m.session == session) else { return };
+		let name = self.members[index].name.clone();
+		match result {
+			Ok(()) => {
+				self.tasks.retain(|task| task.session != session);
+				self.members[index].busy = false;
+				self.members[index].error = None;
+				events.push(EvenEvent::Stopped { name: name.clone() });
+				if remove {
+					self.members.remove(index);
+					events.push(EvenEvent::ClosePage { name: name.clone() });
+				}
+				self.push(
+					RecordKind::System,
+					Some(&name),
+					None,
+					if remove {
+						format!("移除 @{name}，它的任务一起没了。")
+					} else {
+						format!("@{name}：已中断。")
+					},
+				);
+			}
+			Err(error) => {
+				self.members[index].error = Some(error.clone());
+				self.push(RecordKind::Error, Some(&name), None, format!("@{name}：中断失败：{error}"));
+			}
+		}
+	}
+
+	fn prompt_failed(&mut self, session: &str, started: Instant, error: String) {
+		let Some(index) = self.members.iter().position(|m| m.session == session) else { return };
+		// A late prompt response must not clear a newer task or an ongoing stop.
+		if !self.tasks.iter().any(|task| task.session == session && task.started == started) {
+			return;
+		}
+		if !self.stopping.contains(session) {
+			self.tasks.retain(|task| task.session != session);
+			self.members[index].busy = false;
+		}
+		self.members[index].error = Some(error.clone());
+		let name = self.members[index].name.clone();
+		self.push(RecordKind::Error, Some(&name), None, error);
 	}
 }
 
@@ -151,7 +239,7 @@ impl GroupPane {
 				RecordKind::Error,
 				None,
 				None,
-				String::from("opencode server 没有起来；even 只能当记事本用。检查 D:\\OPENCODE\\opencode.exe。"),
+				String::from("opencode server 没有起来，当前不能添加成员或发送任务。检查 DELTA_OPENCODE 指向的程序。"),
 			);
 		}
 		Self {
@@ -296,7 +384,7 @@ impl GroupPane {
 	pub fn scroll(&self, delta: i32) {
 		if let Ok(mut group) = self.inner.lock() {
 			if delta > 0 {
-				group.scroll = (group.scroll + delta as usize).min(group.records.len());
+				group.scroll = group.scroll.saturating_add(delta as usize);
 			} else {
 				group.scroll = group.scroll.saturating_sub((-delta) as usize);
 			}
@@ -314,6 +402,7 @@ impl GroupPane {
 			Err(_) => return,
 		};
 		let line = line.trim().to_string();
+		let line = half_width(&line);
 		if line.is_empty() {
 			return;
 		}
@@ -358,38 +447,49 @@ impl GroupPane {
 			}
 			return;
 		}
+		if message_body(&line).is_empty() {
+			if let Ok(mut group) = self.inner.lock() {
+				group.push(RecordKind::System, None, None, String::from("在 @代号 后写要说的话，例如 @sam 你好。"));
+			}
+			return;
+		}
 		let Some(client) = self.client.clone() else {
 			return;
 		};
+		// A human message starts a new chain; AI handoffs from the previous one no longer count.
+		if let Ok(mut group) = self.inner.lock() {
+			group.ai_round = 0;
+			group.ai_said.clear();
+		}
 		for target in &targets {
+			let started = Instant::now();
 			let session = {
 				let Ok(mut group) = self.inner.lock() else { return };
 				let Some(index) = group.members.iter().position(|m| m.name == *target) else { continue };
-				group.tasks.retain(|t| t.member != *target);
-				group.tasks.push(Task { member: target.clone(), started: Instant::now() });
+				let session = group.members[index].session.clone();
+				if !group.session_can_act(&session) {
+					group.push(RecordKind::Error, Some(target), None, String::from("正在等待中断确认，尚未发送新任务。"));
+					continue;
+				}
+				group.tasks.retain(|t| t.session != session);
+				group.tasks.push(Task { session: session.clone(), started });
 				let member = &mut group.members[index];
 				member.busy = true;
 				member.error = None;
-				member.session.clone()
+				session
 			};
 			if let Ok(mut group) = self.inner.lock() {
 				group.push(RecordKind::Human, Some("you"), Some(target), line.clone());
 			}
 			let inner = self.inner.clone();
 			let dirty = self.dirty.clone();
-			let target = target.clone();
 			let client = client.clone();
-			let line = line.clone();
+			let line = message_body(&line).to_string();
 			thread::spawn(move || {
 				let result = client.prompt(&session, &line);
 				if let Err(err) = result {
 					if let Ok(mut group) = inner.lock() {
-						group.tasks.retain(|t| t.member != target);
-						if let Some(member) = group.members.iter_mut().find(|m| m.name == target) {
-							member.busy = false;
-							member.error = Some(err.clone());
-						}
-						group.push(RecordKind::Error, Some(&target), None, err);
+						group.prompt_failed(&session, started, err);
 					}
 					dirty.store(true, Ordering::Relaxed);
 				}
@@ -426,8 +526,8 @@ impl GroupPane {
 						}
 					},
 				};
-				let role = pieces.next().map(String::from);
-				self.add_member(&model, role.as_deref());
+				let role = rest.split_once(char::is_whitespace).map(|(_, role)| role.trim()).filter(|role| !role.is_empty());
+				self.add_member(&model, role);
 			}
 			"remove" => self.remove_member(rest),
 			"members" => {
@@ -514,15 +614,26 @@ impl GroupPane {
 		let inner = self.inner.clone();
 		let dirty = self.dirty.clone();
 		let role = role.map(String::from);
+		let name = match inner.lock() {
+			Ok(mut group) => {
+				let name = group.next_name();
+				group.adding.insert(name.clone());
+				name
+			}
+			Err(_) => return,
+		};
+		let identity = format!("{}:{name}", self.name);
+		let running = self.running.clone();
 		thread::spawn(move || {
-			let name = match inner.lock() {
-				Ok(group) => group.next_name(),
-				Err(_) => return,
-			};
 			let title = format!("even-{name}");
-			match client.create_session(&root, &title, &model) {
+			match client.create_session(&root, &title, &model, &identity, role.as_deref()) {
 				Ok(session) => {
+					if !running.load(Ordering::Relaxed) {
+						let _ = client.interrupt(&session);
+						return;
+					}
 					if let Ok(mut group) = inner.lock() {
+						group.adding.remove(&name);
 						group.members.push(Member {
 							name: name.clone(),
 							model: model.clone(),
@@ -543,6 +654,7 @@ impl GroupPane {
 				}
 				Err(err) => {
 					if let Ok(mut group) = inner.lock() {
+						group.adding.remove(&name);
 						group.push(RecordKind::Error, None, None, format!("建会话失败：{err}"));
 					}
 					dirty.store(true, Ordering::Relaxed);
@@ -552,60 +664,40 @@ impl GroupPane {
 	}
 
 	fn remove_member(&self, name: &str) {
-		let name = name.trim();
-		if name.is_empty() {
-			return;
-		}
-		let removed = match self.inner.lock() {
-			Ok(mut group) => {
-				let index = group.members.iter().position(|m| m.name == name);
-				index.map(|i| group.members.remove(i))
-			}
-			Err(_) => None,
-		};
-		if let Some(member) = removed {
-			if let Some(client) = self.client.clone() {
-				let session = member.session.clone();
-				thread::spawn(move || {
-					let _ = client.interrupt(&session);
-				});
-			}
-			if let Ok(mut events) = self.events.lock() {
-				events.push(EvenEvent::ClosePage { name: String::from(name) });
-			}
-			if let Ok(mut group) = self.inner.lock() {
-				group.tasks.retain(|t| t.member != name);
-				group.push(RecordKind::System, None, None, format!("移除 @{name}，它的任务一起没了。"));
-			}
+		if !name.trim().is_empty() {
+			self.interrupt(Some(name.trim()), true);
 		}
 	}
 
 	pub fn stop(&self, name: Option<&str>) {
-		let targets: Vec<(String, String)> = match self.inner.lock() {
-			Ok(mut group) => {
-				let targets: Vec<(String, String)> = group
-					.members
-					.iter()
-					.filter(|m| name.map(|n| m.name == n).unwrap_or(true))
-					.map(|m| (m.name.clone(), m.session.clone()))
-					.collect();
-				group.tasks.retain(|t| !targets.iter().any(|(n, _)| *n == t.member));
-				for member in &mut group.members {
-					if targets.iter().any(|(n, _)| *n == member.name) {
-						member.busy = false;
+		self.interrupt(name, false);
+	}
+
+	pub fn session_can_act(&self, session: &str) -> bool {
+		self.inner.lock().is_ok_and(|group| group.session_can_act(session))
+	}
+
+	fn interrupt(&self, name: Option<&str>, remove: bool) {
+		let Some(client) = self.client.clone() else { return };
+		let sessions = {
+			let Ok(mut group) = self.inner.lock() else { return };
+			let Ok(mut events) = self.events.lock() else { return };
+			group.stop(name, remove, &mut events)
+		};
+		let inner = self.inner.clone();
+		let events = self.events.clone();
+		let dirty = self.dirty.clone();
+		thread::spawn(move || {
+			for session in sessions {
+				let result = client.interrupt(&session);
+				if let Ok(mut group) = inner.lock() {
+					if let Ok(mut events) = events.lock() {
+						group.interrupted(&session, result, &mut events);
 					}
 				}
-				targets
+				dirty.store(true, Ordering::Relaxed);
 			}
-			Err(_) => Vec::new(),
-		};
-		if let Some(client) = self.client.clone() {
-			thread::spawn(move || {
-				for (_, session) in targets {
-					let _ = client.interrupt(&session);
-				}
-			});
-		}
+		});
 	}
 
 	pub fn render(&self, canvas: &Canvas, area: Rect, focused: bool) {
@@ -616,7 +708,7 @@ impl GroupPane {
 		let bg = canvas::rgb(canvas::DEFAULT_BG.0, canvas::DEFAULT_BG.1, canvas::DEFAULT_BG.2);
 		canvas.fill(area.left, area.top, area.left + cols as i32 * cw, area.top + rows as i32 * ch, bg);
 		let saved = canvas.clip((area.left, area.top, area.left + cols as i32 * cw, area.top + rows as i32 * ch));
-		let Ok(group) = self.inner.lock() else {
+		let Ok(mut group) = self.inner.lock() else {
 			canvas.unclip(saved);
 			return;
 		};
@@ -681,7 +773,8 @@ impl GroupPane {
 			}
 		}
 		let total = lines.len();
-		let start = total.saturating_sub(body_rows).saturating_sub(group.scroll.min(total.saturating_sub(body_rows)));
+		group.scroll = group.scroll.min(total.saturating_sub(body_rows));
+		let start = total.saturating_sub(body_rows).saturating_sub(group.scroll);
 		for (i, (line, color)) in lines.iter().skip(start).take(body_rows).enumerate() {
 			canvas.text(area.left, y0 + (2 + i as i32) * ch, &truncate(line, cols), *color);
 		}
@@ -713,6 +806,22 @@ impl GroupPane {
 			}
 		}
 		canvas.unclip(saved);
+	}
+
+	/// 输入行光标所在的格坐标（相对面板左上角），与 render 的画法一致。
+	pub fn caret_cell(&self, cols: usize, rows: usize) -> (usize, usize) {
+		let Ok(group) = self.inner.lock() else {
+			return (2, rows.saturating_sub(1));
+		};
+		let avail = cols.saturating_sub(2);
+		let widths: Vec<usize> = group.input.iter().map(|c| c.width().unwrap_or(1)).collect();
+		let mut col = widths[..group.cursor.min(widths.len())].iter().sum::<usize>();
+		let mut start_idx = 0usize;
+		while col >= avail && start_idx < group.cursor {
+			col -= widths[start_idx];
+			start_idx += 1;
+		}
+		(2 + col.min(avail), rows.saturating_sub(1))
 	}
 }
 
@@ -778,16 +887,17 @@ fn poll_once(data: &Arc<Mutex<Group>>, client: &Client, dirty: &Arc<AtomicBool>)
 		}
 		let Ok(mut group) = data.lock() else { return };
 		let names: Vec<String> = group.members.iter().map(|m| m.name.clone()).collect();
+		let mut handoffs: Vec<(String, String)> = Vec::new();
 		for (id, reply) in replies {
 			if group.seen.contains(&id) {
 				continue;
 			}
 			group.seen.insert(id);
-			let task = group.tasks.iter().find(|t| t.member == name).cloned();
+			let task = group.tasks.iter().find(|t| t.session == session).cloned();
 			let seconds = task.as_ref().map(|t| t.started.elapsed().as_secs_f64());
-			group.tasks.retain(|t| t.member != name);
-			{
-				let Some(member) = group.members.iter_mut().find(|m| m.name == name) else { break };
+			if !group.stopping.contains(&session) {
+				group.tasks.retain(|t| t.session != session);
+				let Some(member) = group.members.iter_mut().find(|m| m.session == session) else { break };
 				member.busy = false;
 			}
 			match reply {
@@ -812,11 +922,47 @@ fn poll_once(data: &Arc<Mutex<Group>>, client: &Client, dirty: &Arc<AtomicBool>)
 						group.records.push(Record {
 							kind: RecordKind::Suggestion,
 							member: Some(name.clone()),
-							to: Some(to),
-							text: line,
+							to: Some(to.clone()),
+							text: line.clone(),
 							cost: None,
 							seconds: None,
 						});
+						let body = message_body(&line).to_string();
+						if body.is_empty() {
+							continue;
+						}
+						if group.ai_round >= AI_EXCHANGE_LIMIT {
+							group.push(
+								RecordKind::System,
+								None,
+								None,
+								format!("AI 之间已经来回 {AI_EXCHANGE_LIMIT} 次，先停下；你说一句再继续。"),
+							);
+							break;
+						}
+						let Some(member) = group.members.iter().find(|m| m.name == to) else { continue };
+						if member.busy {
+							group.push(RecordKind::System, None, None, format!("@{to} 正在忙，这条 @ 没有转过去。"));
+							continue;
+						}
+						let target_session = member.session.clone();
+						if !group.session_can_act(&target_session) {
+							group.push(RecordKind::System, None, None, format!("@{to} 正在等中断确认，这条 @ 没有转过去。"));
+							continue;
+						}
+						if !group.ai_said.insert((name.clone(), to.clone(), body.clone())) {
+							group.push(RecordKind::System, None, None, format!("同样的话已经对 @{to} 说过，没有重复转。"));
+							continue;
+						}
+						group.ai_round += 1;
+						group.tasks.retain(|t| t.session != target_session);
+						group.tasks.push(Task { session: target_session.clone(), started: Instant::now() });
+						if let Some(member) = group.members.iter_mut().find(|m| m.name == to) {
+							member.busy = true;
+							member.error = None;
+						}
+						group.push(RecordKind::System, Some(&name), Some(&to), format!("@{name} 的话转给了 @{to}。"));
+						handoffs.push((target_session, body));
 					}
 				}
 				Err(error) => {
@@ -831,13 +977,30 @@ fn poll_once(data: &Arc<Mutex<Group>>, client: &Client, dirty: &Arc<AtomicBool>)
 				}
 			}
 		}
+		for (session, body) in handoffs {
+			let inner = data.clone();
+			let client = client.clone();
+			let dirty = dirty.clone();
+			let started = Instant::now();
+			thread::spawn(move || {
+				if let Err(err) = client.prompt(&session, &body) {
+					if let Ok(mut group) = inner.lock() {
+						group.prompt_failed(&session, started, err);
+					}
+					dirty.store(true, Ordering::Relaxed);
+				}
+			});
+		}
 		for (id, outcome, error) in idles {
 			if group.seen.contains(&id) {
 				continue;
 			}
 			group.seen.insert(id);
-			if let Some(member) = group.members.iter_mut().find(|m| m.name == name) {
-				member.busy = false;
+			if !group.stopping.contains(&session) {
+				group.tasks.retain(|t| t.session != session);
+				if let Some(member) = group.members.iter_mut().find(|m| m.session == session) {
+					member.busy = false;
+				}
 			}
 			if outcome == "failed" || outcome == "interrupted" {
 				let text = if outcome == "interrupted" {
@@ -858,7 +1021,6 @@ fn poll_once(data: &Arc<Mutex<Group>>, client: &Client, dirty: &Arc<AtomicBool>)
 				});
 			}
 		}
-		group.scroll = group.scroll.min(group.records.len());
 		dirty.store(true, Ordering::Relaxed);
 	}
 }
@@ -920,6 +1082,24 @@ fn assistant_reply(message: &Value) -> Option<Result<Reply, String>> {
 	}))
 }
 
+/// 中文输入法会提交全角冒号和全角 @；命令和 @ 按半角解释。
+fn half_width(text: &str) -> String {
+	if text.contains(['：', '＠']) {
+		text.replace('：', ":").replace('＠', "@")
+	} else {
+		text.to_string()
+	}
+}
+
+fn message_body(text: &str) -> &str {
+	let mut body = text.trim_start();
+	while body.starts_with('@') {
+		let end = body.find(char::is_whitespace).unwrap_or(body.len());
+		body = body[end..].trim_start();
+	}
+	body
+}
+
 fn mentions(text: &str) -> Vec<String> {
 	let mut out = Vec::new();
 	for token in text.split_whitespace() {
@@ -959,7 +1139,7 @@ fn prefix_width(prefix: &str) -> usize {
 }
 
 fn wrap_text(text: &str, width: usize) -> Vec<String> {
-	let width = width.max(8);
+	let width = width.max(1);
 	let mut out = Vec::new();
 	let mut line = String::new();
 	let mut width_now = 0usize;
@@ -1009,6 +1189,67 @@ fn unused_now() -> u64 {
 mod tests {
 	use super::*;
 	use serde_json::json;
+
+	#[test]
+	fn routing_prefix_is_not_an_opencode_mention() {
+		assert_eq!(message_body("@sam hello ,who are you"), "hello ,who are you");
+		assert_eq!(message_body("@sam @apple\t请核对 @lake 的建议"), "请核对 @lake 的建议");
+		assert_eq!(message_body("@sam"), "");
+		assert_eq!(message_body("  原样保留  空格"), "原样保留  空格");
+	}
+
+	#[test]
+	fn pending_members_reserve_distinct_names() {
+		let mut group = Group::new();
+		assert_eq!(group.next_name(), "sam");
+		group.adding.insert("sam".into());
+		assert_eq!(group.next_name(), "apple");
+	}
+
+	#[test]
+	fn caret_follows_input_and_scrolls_with_the_text() {
+		let pane = GroupPane::new("even1", "E:/Delta", None);
+		pane.insert_text("：add");
+		assert_eq!(pane.caret_cell(40, 10), (7, 9));
+		pane.insert_text(&"a".repeat(50));
+		assert_eq!(pane.caret_cell(20, 10), (19, 9));
+	}
+
+	#[test]
+	fn full_width_command_markers_are_folded() {
+		assert_eq!(half_width("：add"), ":add");
+		assert_eq!(half_width("＠sam 你好"), "@sam 你好");
+		assert_eq!(half_width("Hello，世界"), "Hello，世界");
+		assert_eq!(mentions(&half_width("＠sam 你好")), vec!["sam".to_string()]);
+	}
+
+	#[test]
+	fn stop_requires_confirmation_and_failure_keeps_task() {
+		let mut group = Group::new();
+		group.members.push(Member {
+			name: "sam".into(), model: "test".into(), role: None, session: "s1".into(),
+			busy: true, error: None, last_cost: None,
+		});
+		group.tasks.push(Task { session: "s1".into(), started: Instant::now() });
+		let mut events = Vec::new();
+		assert_eq!(group.stop(Some("sam"), false, &mut events), vec!["s1"]);
+		assert!(!group.session_can_act("s1"));
+		assert!(group.members[0].busy);
+		assert_eq!(group.tasks.len(), 1);
+		assert!(group.stop(Some("sam"), false, &mut events).is_empty());
+		group.interrupted("s1", Err("offline".into()), &mut events);
+		assert!(group.members[0].busy);
+		assert_eq!(group.tasks.len(), 1);
+		assert!(group.session_can_act("s1"));
+		assert!(!events.iter().any(|event| matches!(event, EvenEvent::Stopped { .. })));
+		group.stop(Some("sam"), true, &mut events);
+		assert_eq!(group.members.len(), 1);
+		group.interrupted("s1", Ok(()), &mut events);
+		assert!(group.members.is_empty());
+		assert!(group.tasks.is_empty());
+		assert!(!group.session_can_act("s1"));
+		assert!(events.iter().any(|event| matches!(event, EvenEvent::ClosePage { name } if name == "sam")));
+	}
 
 	#[test]
 	fn parses_flat_assistant_message() {
