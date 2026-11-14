@@ -12,8 +12,16 @@ use windows_sys::Win32::Graphics::Gdi::{
 	BitBlt, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateCompatibleBitmap, CreateCompatibleDC,
 	CreateFontW, CreatePen, CreateSolidBrush, DEFAULT_CHARSET, DeleteDC, DeleteObject, FF_MODERN,
 	FIXED_PITCH, FW_NORMAL, FillRect, GetDC, GetTextExtentPoint32W, HDC, HFONT, HGDIOBJ,
-	IntersectClipRect, LineTo, MoveToEx, OUT_DEFAULT_PRECIS, PS_SOLID, Rectangle, ReleaseDC,
-	RestoreDC, SRCCOPY, SaveDC, SelectObject, SetBkMode, SetTextColor, TRANSPARENT, TextOutW,
+	IntersectClipRect, HALFTONE, LineTo, MoveToEx, OUT_DEFAULT_PRECIS, PS_SOLID, Rectangle,
+	ReleaseDC, RestoreDC, RoundRect, SRCCOPY, SaveDC, SelectObject, SetBkMode,
+	SetStretchBltMode, SetTextColor, StretchBlt, TRANSPARENT, TextOutW,
+};
+use windows_sys::Win32::Graphics::GdiPlus::{
+	FillModeAlternate, GdipAddPathArc, GdipClosePathFigure, GdipCreateFromHDC, GdipCreatePath,
+	GdipCreatePen1, GdipCreateSolidFill, GdipDeleteBrush, GdipDeleteGraphics, GdipDeletePath,
+	GdipDeletePen, GdipDrawPath, GdipFillPath, GdipSetSmoothingMode, GdiplusShutdown,
+	GdiplusStartup, GdiplusStartupInput, GpBrush, GpGraphics, GpPath, GpSolidFill,
+	SmoothingModeAntiAlias, UnitPixel,
 };
 
 /// The size every pane starts at; status bar, borders and modals always use it.
@@ -33,6 +41,9 @@ pub struct Canvas {
 	pub mem: HDC,
 	bmp: windows_sys::Win32::Graphics::Gdi::HBITMAP,
 	old: HGDIOBJ,
+	/// GDI+ 也画在这块 DC 上；圆角靠它抗锯齿，GDI 的 RoundRect 是硬像素阶梯。
+	graphics: *mut GpGraphics,
+	gdiplus: usize,
 	face: &'static str,
 	faces: HashMap<i32, Face>,
 	/// Font size currently selected; `cell_w`/`cell_h` belong to it.
@@ -57,10 +68,18 @@ impl Canvas {
 				return None;
 			}
 			ReleaseDC(hwnd, screen);
+			let mut token: usize = 0;
+			let mut startup: GdiplusStartupInput = zeroed();
+			startup.GdiplusVersion = 1;
+			GdiplusStartup(&mut token, &startup, null_mut());
+			let mut graphics: *mut GpGraphics = null_mut();
+			GdipCreateFromHDC(mem, &mut graphics);
 			let mut canvas = Self {
 				mem,
 				bmp: null_mut(),
 				old: null_mut(),
+				graphics,
+				gdiplus: token,
 				face: pick_font(),
 				faces: HashMap::new(),
 				font_size: FONT_SIZE,
@@ -162,6 +181,11 @@ impl Canvas {
 			}
 			SetBkMode(mem, TRANSPARENT as i32);
 			ReleaseDC(hwnd, screen);
+			let mut graphics: *mut GpGraphics = null_mut();
+			GdipCreateFromHDC(mem, &mut graphics);
+			if !self.graphics.is_null() {
+				GdipDeleteGraphics(self.graphics);
+			}
 			if !self.bmp.is_null() {
 				SelectObject(self.mem, self.old);
 				DeleteObject(self.bmp);
@@ -172,6 +196,7 @@ impl Canvas {
 			self.mem = mem;
 			self.bmp = bmp;
 			self.old = old;
+			self.graphics = graphics;
 			self.width = width;
 			self.height = height;
 		}
@@ -205,6 +230,44 @@ impl Canvas {
 			let brush = CreateSolidBrush(color);
 			FillRect(self.mem, &rect, brush);
 			DeleteObject(brush);
+		}
+	}
+
+	/// Draws [left, top)-[right, bottom) of what is already in the frame,
+	/// shrunk into `x`, `y`, `w`, `h`. The lifted-window thumbnail is the
+	/// window's own picture, so it never shows stale or invented content.
+	pub fn stretch_from(
+		&self,
+		left: i32,
+		top: i32,
+		right: i32,
+		bottom: i32,
+		x: i32,
+		y: i32,
+		w: i32,
+		h: i32,
+	) {
+		let (sw, sh) = (right - left, bottom - top);
+		if sw <= 0 || sh <= 0 || w <= 0 || h <= 0 {
+			return;
+		}
+		unsafe {
+			let dc = CreateCompatibleDC(self.mem);
+			if dc.is_null() {
+				return;
+			}
+			let bmp = CreateCompatibleBitmap(self.mem, sw, sh);
+			if bmp.is_null() {
+				DeleteDC(dc);
+				return;
+			}
+			let old = SelectObject(dc, bmp);
+			BitBlt(dc, 0, 0, sw, sh, self.mem, left, top, SRCCOPY);
+			SetStretchBltMode(self.mem, HALFTONE as i32);
+			StretchBlt(self.mem, x, y, w, h, dc, 0, 0, sw, sh, SRCCOPY);
+			SelectObject(dc, old);
+			DeleteObject(bmp);
+			DeleteDC(dc);
 		}
 	}
 
@@ -257,6 +320,114 @@ impl Canvas {
 		}
 	}
 
+	/// Rounded rectangle with only its edge painted, for pane frames, drop
+	/// previews and the floating window box. `width` is the line thickness in
+	/// pixels.
+	pub fn round_outline(
+		&self,
+		left: i32,
+		top: i32,
+		right: i32,
+		bottom: i32,
+		radius: i32,
+		width: i32,
+		color: COLORREF,
+	) {
+		if right <= left || bottom <= top {
+			return;
+		}
+		let path = round_path(self.graphics, left, top, right, bottom, radius);
+		if path.is_null() {
+			self.round_outline_gdi(left, top, right, bottom, radius, width, color);
+			return;
+		}
+		unsafe {
+			let mut pen = null_mut();
+			if GdipCreatePen1(
+				argb(color),
+				width.max(1) as f32,
+				UnitPixel,
+				&mut pen,
+			) == 0
+			{
+				GdipDrawPath(self.graphics, pen, path);
+				GdipDeletePen(pen);
+			}
+			GdipDeletePath(path);
+		}
+	}
+
+	fn round_outline_gdi(
+		&self,
+		left: i32,
+		top: i32,
+		right: i32,
+		bottom: i32,
+		radius: i32,
+		width: i32,
+		color: COLORREF,
+	) {
+		unsafe {
+			let brush = windows_sys::Win32::Graphics::Gdi::GetStockObject(5); // NULL_BRUSH
+			let old_brush = SelectObject(self.mem, brush);
+			let pen = CreatePen(PS_SOLID, width.max(1), color);
+			let old_pen = SelectObject(self.mem, pen as HGDIOBJ);
+			let d = (radius * 2).max(2);
+			RoundRect(self.mem, left, top, right, bottom, d, d);
+			SelectObject(self.mem, old_pen);
+			SelectObject(self.mem, old_brush);
+			DeleteObject(pen);
+		}
+	}
+
+	/// Filled rounded rectangle. `line` draws its edge; `None` leaves the edge
+	/// as the fill. `radius` is the corner radius in pixels.
+	pub fn round_rect(
+		&self,
+		left: i32,
+		top: i32,
+		right: i32,
+		bottom: i32,
+		radius: i32,
+		fill: COLORREF,
+		line: Option<COLORREF>,
+	) {
+		if right <= left || bottom <= top {
+			return;
+		}
+		let path = round_path(self.graphics, left, top, right, bottom, radius);
+		if path.is_null() {
+			unsafe {
+				let brush = CreateSolidBrush(fill);
+				let pen = CreatePen(PS_SOLID, 1, line.unwrap_or(fill));
+				let old_brush = SelectObject(self.mem, brush as HGDIOBJ);
+				let old_pen = SelectObject(self.mem, pen as HGDIOBJ);
+				let d = (radius * 2).max(2);
+				RoundRect(self.mem, left, top, right, bottom, d, d);
+				SelectObject(self.mem, old_pen);
+				SelectObject(self.mem, old_brush);
+				DeleteObject(pen);
+				DeleteObject(brush);
+			}
+			return;
+		}
+		unsafe {
+			let mut brush: *mut GpSolidFill = null_mut();
+			if GdipCreateSolidFill(argb(fill), &mut brush) == 0 {
+				GdipFillPath(self.graphics, brush as *mut GpBrush, path);
+				GdipDeleteBrush(brush as *mut GpBrush);
+			}
+			if let Some(color) = line {
+				let mut pen = null_mut();
+				if GdipCreatePen1(argb(color), 1.0, UnitPixel, &mut pen) == 0 {
+					GdipDrawPath(self.graphics, pen, path);
+					GdipDeletePen(pen);
+				}
+			}
+			GdipDeletePath(path);
+		}
+	}
+
 	pub fn present(&self, hwnd: HWND) {
 		unsafe {
 			let screen = GetDC(hwnd);
@@ -281,6 +452,9 @@ impl Canvas {
 impl Drop for Canvas {
 	fn drop(&mut self) {
 		unsafe {
+			if !self.graphics.is_null() {
+				GdipDeleteGraphics(self.graphics);
+			}
 			if !self.bmp.is_null() {
 				SelectObject(self.mem, self.old);
 				DeleteObject(self.bmp);
@@ -293,12 +467,58 @@ impl Drop for Canvas {
 			if !self.mem.is_null() {
 				DeleteDC(self.mem);
 			}
+			GdiplusShutdown(self.gdiplus);
 		}
 	}
 }
 
+/// Path for a rounded rectangle. Coordinates sit on pixel centres (n + 0.5)
+/// so a one-pixel stroke stays one pixel wide instead of smearing over two.
+/// Returns null when GDI+ is unavailable; callers fall back to GDI RoundRect.
+fn round_path(
+	graphics: *mut GpGraphics,
+	left: i32,
+	top: i32,
+	right: i32,
+	bottom: i32,
+	radius: i32,
+) -> *mut GpPath {
+	if graphics.is_null() {
+		return null_mut();
+	}
+	unsafe {
+		GdipSetSmoothingMode(graphics, SmoothingModeAntiAlias);
+		let mut path: *mut GpPath = null_mut();
+		if GdipCreatePath(FillModeAlternate, &mut path) != 0 {
+			return null_mut();
+		}
+		let half_w = (right - left).max(2) as f32 / 2.0;
+		let half_h = (bottom - top).max(2) as f32 / 2.0;
+		let r = (radius.max(0) as f32).min(half_w).min(half_h);
+		let d = r * 2.0;
+		// GDI+ 把像素中心放在整数坐标上，直线落在整数上才是实心一像素。
+		let l = left as f32;
+		let t = top as f32;
+		let rt = (right - 1) as f32;
+		let b = (bottom - 1) as f32;
+		GdipAddPathArc(path, l, t, d, d, 180.0, 90.0);
+		GdipAddPathArc(path, rt - d, t, d, d, 270.0, 90.0);
+		GdipAddPathArc(path, rt - d, b - d, d, d, 0.0, 90.0);
+		GdipAddPathArc(path, l, b - d, d, d, 90.0, 90.0);
+		GdipClosePathFigure(path);
+		path
+	}
+}
+
+/// COLORREF (0x00BBGGRR) as the ARGB GDI+ wants.
+fn argb(color: COLORREF) -> u32 {
+	0xFF00_0000 | ((color & 0xFF) << 16) | (color & 0xFF00) | ((color >> 16) & 0xFF)
+}
+
 fn pick_font() -> &'static str {
-	if font_exists("Cascadia Mono") {
+	if font_exists("JetBrainsMono NFM") {
+		"JetBrainsMono NFM"
+	} else if font_exists("Cascadia Mono") {
 		"Cascadia Mono"
 	} else if font_exists("Cascadia Code") {
 		"Cascadia Code"
@@ -346,14 +566,36 @@ pub fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
 	(r as u32) | ((g as u32) << 8) | ((b as u32) << 16)
 }
 
-pub const DEFAULT_FG: (u8, u8, u8) = (212, 216, 226);
-pub const DEFAULT_BG: (u8, u8, u8) = (16, 18, 24);
-pub const SELECTION_BG: (u8, u8, u8) = (46, 64, 92);
-pub const BORDER: (u8, u8, u8) = (40, 42, 52);
-pub const BORDER_ACTIVE: (u8, u8, u8) = (96, 132, 168);
-pub const STATUS_BG: (u8, u8, u8) = (24, 26, 34);
-pub const STATUS_FG: (u8, u8, u8) = (160, 166, 180);
-pub const ACCENT: (u8, u8, u8) = (120, 168, 220);
+pub fn rgb_tuple(c: (u8, u8, u8)) -> COLORREF {
+	rgb(c.0, c.1, c.2)
+}
+
+// Catppuccin Mocha, the theme named in the reference ghostty config
+// (`theme = Catppuccin Mocha`). Base is the terminal background, mantle the
+// bars, surface the chips, and the bright accents the badges.
+pub const BASE: (u8, u8, u8) = (30, 30, 46); // #1e1e2e
+pub const MANTLE: (u8, u8, u8) = (24, 24, 37); // #181825
+pub const SURFACE0: (u8, u8, u8) = (49, 50, 68); // #313244
+pub const SURFACE1: (u8, u8, u8) = (69, 71, 90); // #45475a
+pub const OVERLAY1: (u8, u8, u8) = (127, 132, 156); // #7f849c
+pub const SUBTEXT0: (u8, u8, u8) = (166, 173, 200); // #a6adc8
+pub const TEXT: (u8, u8, u8) = (205, 214, 244); // #cdd6f4
+pub const BLUE: (u8, u8, u8) = (137, 180, 250); // #89b4fa
+pub const GREEN: (u8, u8, u8) = (166, 227, 161); // #a6e3a1
+pub const YELLOW: (u8, u8, u8) = (249, 226, 175); // #f9e2af
+pub const PEACH: (u8, u8, u8) = (250, 179, 135); // #fab387
+pub const PINK: (u8, u8, u8) = (245, 194, 231); // #f5c2e7
+pub const MAUVE: (u8, u8, u8) = (203, 166, 247); // #cba6f7
+pub const TEAL: (u8, u8, u8) = (148, 226, 213); // #94e2d5
+
+pub const DEFAULT_FG: (u8, u8, u8) = TEXT;
+pub const DEFAULT_BG: (u8, u8, u8) = BASE;
+pub const SELECTION_BG: (u8, u8, u8) = SURFACE1;
+pub const BORDER: (u8, u8, u8) = SURFACE0;
+pub const BORDER_ACTIVE: (u8, u8, u8) = BLUE;
+pub const STATUS_BG: (u8, u8, u8) = MANTLE;
+pub const STATUS_FG: (u8, u8, u8) = TEXT;
+pub const ACCENT: (u8, u8, u8) = BLUE;
 
 pub fn colorref(c: delta_vt::Color, bold: bool, background: bool) -> COLORREF {
 	use delta_vt::Color;
@@ -380,23 +622,25 @@ pub fn colorref(c: delta_vt::Color, bold: bool, background: bool) -> COLORREF {
 }
 
 fn indexed(n: u8, bold: bool) -> (u8, u8, u8) {
+	// Catppuccin Mocha's ANSI sixteen, so program output sits on the same
+	// palette as the chrome.
 	const PALETTE: [(u8, u8, u8); 16] = [
-		(24, 26, 32),
-		(205, 92, 100),
-		(120, 180, 120),
-		(200, 180, 110),
-		(100, 140, 200),
-		(170, 120, 190),
-		(100, 180, 190),
-		(200, 200, 200),
-		(120, 124, 136),
-		(235, 120, 128),
-		(150, 210, 150),
-		(235, 215, 140),
-		(130, 170, 235),
-		(205, 150, 225),
-		(130, 215, 225),
-		(240, 240, 240),
+		(69, 71, 90),    // black: surface1
+		(243, 139, 168), // red
+		(166, 227, 161), // green
+		(249, 226, 175), // yellow
+		(137, 180, 250), // blue
+		(245, 194, 231), // magenta: pink
+		(148, 226, 213), // cyan: teal
+		(186, 194, 222), // white: subtext1
+		(88, 91, 112),   // bright black: surface2
+		(243, 139, 168), // bright red
+		(166, 227, 161), // bright green
+		(249, 226, 175), // bright yellow
+		(137, 180, 250), // bright blue
+		(245, 194, 231), // bright magenta
+		(148, 226, 213), // bright cyan
+		(166, 173, 200), // bright white: subtext0
 	];
 	if n < 16 {
 		let c = PALETTE[n as usize];

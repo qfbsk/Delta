@@ -97,6 +97,7 @@ impl Geometry {
 }
 
 /// struct layout_cell, stored in an arena so parent/child links stay simple.
+#[derive(Clone)]
 struct Cell {
 	lc_type: LayoutType,
 	parent: Option<usize>,
@@ -105,6 +106,7 @@ struct Cell {
 	cells: Vec<usize>,
 }
 
+#[derive(Clone)]
 pub struct Layout {
 	cells: Vec<Cell>,
 	root: Option<usize>,
@@ -854,6 +856,44 @@ impl Layout {
 		true
 	}
 
+	/// Exchange the window ids of two leaves; the tree, the sizes and the cell
+	/// geometry stay where they are, so this is the cheap "swap places" move.
+	pub fn swap(&mut self, a: PaneId, b: PaneId) -> bool {
+		if a == b {
+			return false;
+		}
+		let (Some(ia), Some(ib)) = (self.index_of(a), self.index_of(b)) else {
+			return false;
+		};
+		self.cells[ia].wp = Some(b);
+		self.cells[ib].wp = Some(a);
+		true
+	}
+
+	/// Put `pane` beside `target` by taking a half split of the target's cell.
+	/// The pane leaves its old cell first, so the space it held goes back to
+	/// its neighbours. A target that is too small for the split restores the
+	/// layout untouched. `before` puts the pane in the left/top half, which the
+	/// split itself cannot express.
+	pub fn move_to(&mut self, pane: PaneId, target: PaneId, dir: Dir, before: bool) -> bool {
+		if pane == target {
+			return false;
+		}
+		if self.index_of(pane).is_none() || self.index_of(target).is_none() {
+			return false;
+		}
+		let backup = self.clone();
+		self.destroy(pane);
+		if !self.can_split(target, dir) || !self.split(target, pane, dir) {
+			*self = backup;
+			return false;
+		}
+		if before {
+			self.swap(pane, target);
+		}
+		true
+	}
+
 	fn index_of(&self, pane: PaneId) -> Option<usize> {
 		let root = self.root?;
 		self.index_of1(root, pane)
@@ -1211,5 +1251,63 @@ mod tests {
 			assert_eq!(g.yoff, 0);
 			assert_eq!(g.sy, 24);
 		}
+	}
+
+	#[test]
+	fn swap_keeps_the_cells_and_moves_the_windows() {
+		let mut layout = Layout::new(0, 80, 24);
+		assert!(layout.split_sized(0, 1, Dir::Right, 20));
+		assert!(layout.swap(0, 1));
+		let panes = layout.panes();
+		let by_id = |id| panes.iter().find(|(pane, _)| *pane == id).unwrap().1;
+		assert_eq!((by_id(0).xoff, by_id(0).sx), (60, 20));
+		assert_eq!((by_id(1).xoff, by_id(1).sx), (0, 59));
+		// The second leaf still follows the first in pane order; only the ids moved.
+		assert_eq!(panes[0].0, 1);
+		assert_eq!(panes[1].0, 0);
+	}
+
+	#[test]
+	fn move_right_of_the_other_pane() {
+		let mut layout = Layout::new(0, 80, 24);
+		assert!(layout.split_sized(0, 1, Dir::Right, 20));
+		assert!(layout.move_to(0, 1, Dir::Right, false));
+		let panes = layout.panes();
+		assert_eq!(panes.len(), 2);
+		let by_id = |id| panes.iter().find(|(pane, _)| *pane == id).unwrap().1;
+		assert_eq!((by_id(1).xoff, by_id(1).sx, by_id(1).sy), (0, 40, 24));
+		assert_eq!((by_id(0).xoff, by_id(0).sx, by_id(0).sy), (41, 39, 24));
+	}
+
+	#[test]
+	fn move_left_of_the_other_pane() {
+		let mut layout = Layout::new(0, 80, 24);
+		assert!(layout.split_sized(0, 1, Dir::Right, 20));
+		assert!(layout.move_to(0, 1, Dir::Right, true));
+		let panes = layout.panes();
+		let by_id = |id| panes.iter().find(|(pane, _)| *pane == id).unwrap().1;
+		assert_eq!((by_id(0).xoff, by_id(0).sx), (0, 40));
+		assert_eq!((by_id(1).xoff, by_id(1).sx), (41, 39));
+	}
+
+	#[test]
+	fn move_above_the_other_pane() {
+		let mut layout = Layout::new(0, 80, 24);
+		assert!(layout.split_sized(0, 1, Dir::Right, 20));
+		assert!(layout.move_to(1, 0, Dir::Down, true));
+		let panes = layout.panes();
+		let by_id = |id| panes.iter().find(|(pane, _)| *pane == id).unwrap().1;
+		assert_eq!((by_id(1).xoff, by_id(1).yoff, by_id(1).sy), (0, 0, 12));
+		assert_eq!((by_id(0).xoff, by_id(0).yoff, by_id(0).sy), (0, 13, 11));
+	}
+
+	#[test]
+	fn moving_the_only_pane_changes_nothing() {
+		let mut layout = Layout::new(0, 80, 24);
+		assert!(!layout.move_to(0, 0, Dir::Right, false));
+		assert!(!layout.swap(0, 0));
+		let panes = layout.panes();
+		assert_eq!(panes.len(), 1);
+		assert_eq!((panes[0].1.xoff, panes[0].1.sx), (0, 80));
 	}
 }

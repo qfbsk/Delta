@@ -12,8 +12,13 @@ use delta_vt::{MouseEncoding, MouseMode};
 use serde_json::{Value, json};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Graphics::Dwm::{
+	DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE, DWMWA_USE_IMMERSIVE_DARK_MODE,
+	DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+};
 use windows_sys::Win32::Graphics::Gdi::{
-	BeginPaint, EndPaint, PAINTSTRUCT, ScreenToClient, UpdateWindow,
+	BeginPaint, EndPaint, GetMonitorInfoW, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+	MonitorFromWindow, PAINTSTRUCT, ScreenToClient, UpdateWindow,
 };
 use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -35,14 +40,20 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
 	CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW,
-	DestroyWindow, DispatchMessageW, FindWindowW, GWLP_USERDATA, GetClientRect,
-	GetForegroundWindow, GetMessageW, GetWindowLongPtrW, IDC_ARROW, LoadCursorW, MSG,
-	PostQuitMessage, RegisterClassW, SW_SHOW, SendMessageW, SetTimer, SetWindowLongPtrW,
+	DestroyWindow, DispatchMessageW, FindWindowW, GWLP_USERDATA, GWL_STYLE, GetClientRect,
+	GetForegroundWindow, GetMessageW, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect,
+	HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTTOPLEFT, HTTOPRIGHT, IDC_ARROW,
+	IsZoomed, LoadCursorW, MSG, NCCALCSIZE_PARAMS,
+	PostQuitMessage, RegisterClassW, SM_CXPADDEDBORDER, SM_CXSIZEFRAME,
+	SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+	SW_SHOW, SendMessageW, SetTimer, SetWindowLongPtrW, SetWindowPos,
 	ShowWindow, TranslateMessage, UnregisterClassW, WM_APP, WM_CHAR, WM_CLOSE, WM_COPYDATA,
 	WM_DESTROY, WM_ERASEBKGND, WM_IME_CHAR, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION,
 	WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
-	WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_SETFOCUS, WM_SIZE, WM_SYSCHAR,
-	WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+	WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCHITTEST, WM_PAINT,
+	WM_SETFOCUS, WM_SIZE, WM_SYSCHAR,
+	WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW, WS_CAPTION, WS_MAXIMIZEBOX, WS_MINIMIZEBOX,
+	WS_SYSMENU, WS_THICKFRAME, WS_VISIBLE,
 };
 
 use crate::canvas::{self, Canvas};
@@ -155,6 +166,34 @@ struct Drag {
 	moved: bool,
 }
 
+/// Where a released pane lands on the pane under the cursor: a half-split on
+/// one side, or the middle of that pane, which trades places.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DropZone {
+	Left,
+	Right,
+	Top,
+	Bottom,
+	Center,
+}
+
+/// Alt+drag of a whole pane in normal/agent. The window's own picture follows
+/// the pointer, and `drop` names the pane and the part of it the release would
+/// land on; `zone` is that part's rectangle, springing into place so a change
+/// of side slides instead of jumping.
+struct PaneDrag {
+	pane: PaneId,
+	start: (i32, i32),
+	at: (i32, i32),
+	/// The drag only starts once the cursor leaves a few pixels of slack, so an
+	/// Alt+click stays a click.
+	active: bool,
+	drop: Option<(PaneId, DropZone)>,
+	/// Highlighted drop area, (left, top, right, bottom) in pixels.
+	zone: Option<[f32; 4]>,
+	zone_v: [f32; 4],
+}
+
 pub struct App {
 	hwnd: HWND,
 	canvas: Canvas,
@@ -185,6 +224,7 @@ pub struct App {
 	clock: u64,
 	prio: HashMap<PaneId, Priority>,
 	drag: Option<Drag>,
+	pane_drag: Option<PaneDrag>,
 	key_chars: HashMap<u16, char>,
 	ime_text: String,
 	ime_caret: Option<(i32, i32)>,
@@ -225,7 +265,8 @@ pub fn run(shell: Option<String>, file: Option<PathBuf>) -> i32 {
 			0,
 			class_name.as_ptr(),
 			title.as_ptr(),
-			WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+			// Delta 自己画整个窗口：粗边框留给拖边改大小，系统菜单留给 Alt+F4。
+			WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_VISIBLE,
 			CW_USEDEFAULT,
 			CW_USEDEFAULT,
 			1180,
@@ -239,6 +280,10 @@ pub fn run(shell: Option<String>, file: Option<PathBuf>) -> i32 {
 			UnregisterClassW(class_name.as_ptr(), module);
 			return 1;
 		}
+		// USER32 会给自己带系统菜单和粗边框的窗口强行补上 WS_CAPTION（实测要
+		// 0x100F0000 得到 0x14CF0000），所以创建后把标题栏摘掉。
+		let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 & !WS_CAPTION;
+		SetWindowLongPtrW(hwnd, GWL_STYLE, style as isize);
 		let mut app = match App::new(hwnd, shell, file) {
 			Ok(app) => Box::new(app),
 			Err(err) => {
@@ -249,6 +294,44 @@ pub fn run(shell: Option<String>, file: Option<PathBuf>) -> i32 {
 			}
 		};
 		SetWindowLongPtrW(hwnd, GWLP_USERDATA, (&mut *app) as *mut App as isize);
+		// 窗口过程就位以后再让系统重算非客户区，这次才走得到自己写的
+		// WM_NCCALCSIZE：整窗都算客户区，四周没有留下画白条的地方。
+		SetWindowPos(
+			hwnd,
+			null_mut(),
+			0,
+			0,
+			0,
+			0,
+			SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
+		);
+		// Win11 给窗口四角裁圆；旧系统调用失败，窗口保持直角。
+		let corner: i32 = DWMWCP_ROUND;
+		unsafe {
+			DwmSetWindowAttribute(
+				hwnd,
+				DWMWA_WINDOW_CORNER_PREFERENCE as u32,
+				&corner as *const i32 as *const std::ffi::c_void,
+				4,
+			);
+			// 系统会给带粗边框的窗口描一圈主题色边，浅色主题下就是一条浅色
+			// 外环。窗口内容自己铺满每一个像素，这圈描边不要；边缘的拖动、
+			// 缩放命中区由 WM_NCHITTEST 认，跟这圈描边无关。
+			let dark: i32 = 1;
+			DwmSetWindowAttribute(
+				hwnd,
+				DWMWA_USE_IMMERSIVE_DARK_MODE as u32,
+				&dark as *const i32 as *const std::ffi::c_void,
+				4,
+			);
+			let none: u32 = DWMWA_COLOR_NONE;
+			DwmSetWindowAttribute(
+				hwnd,
+				DWMWA_BORDER_COLOR as u32,
+				&none as *const u32 as *const std::ffi::c_void,
+				4,
+			);
+		}
 		ShowWindow(hwnd, SW_SHOW);
 		UpdateWindow(hwnd);
 		SetTimer(hwnd, TIMER_ID, 16, None);
@@ -339,6 +422,7 @@ impl App {
 			clock: 0,
 			prio: HashMap::new(),
 			drag: None,
+			pane_drag: None,
 			key_chars: HashMap::new(),
 			ime_text: String::new(),
 			ime_caret: None,
@@ -367,6 +451,51 @@ impl App {
 				0
 			}
 			WM_ERASEBKGND => 1,
+			WM_NCCALCSIZE => {
+				if wparam == 0 {
+					return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+				}
+				// 摘掉标题栏以后系统仍在窗口四周留一圈非客户区，用主题色画成白条。
+				// 干脆一点不留：整个窗口都算客户区，Delta 自己画每一像素。
+				if unsafe { IsZoomed(hwnd) } != 0 {
+					// 最大化时系统把窗口撑出工作区一圈，客户区直接对齐工作区。
+					let mut info: MONITORINFO = unsafe { zeroed() };
+					info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+					let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+					if unsafe { GetMonitorInfoW(monitor, &mut info) } != 0 {
+						let params = lparam as *mut NCCALCSIZE_PARAMS;
+						unsafe {
+							(*params).rgrc[0] = info.rcWork;
+						}
+					}
+				}
+				0
+			}
+			WM_NCHITTEST => {
+				// 没有标题栏，外圈就是窗口的把区：四边拖动整窗，四角改大小。
+				if unsafe { IsZoomed(hwnd) } != 0 {
+					return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+				}
+				let (sx, sy) = point_of(lparam);
+				let mut bounds: RECT = unsafe { zeroed() };
+				unsafe {
+					GetWindowRect(hwnd, &mut bounds);
+				}
+				let edge = frame_width();
+				let left = sx < bounds.left + edge;
+				let right = sx >= bounds.right - edge;
+				let top = sy < bounds.top + edge;
+				let bottom = sy >= bounds.bottom - edge;
+				let hit = match (left, right, top, bottom) {
+					(true, _, true, _) => HTTOPLEFT,
+					(_, true, true, _) => HTTOPRIGHT,
+					(true, _, _, true) => HTBOTTOMLEFT,
+					(_, true, _, true) => HTBOTTOMRIGHT,
+					_ if left || right || top || bottom => HTCAPTION,
+					_ => HTCLIENT,
+				};
+				hit as LRESULT
+			}
 			WM_SIZE => {
 				self.width = (lparam & 0xffff) as i32;
 				self.height = ((lparam >> 16) & 0xffff) as i32;
@@ -427,6 +556,7 @@ impl App {
 				0
 			}
 			WM_KILLFOCUS => {
+				self.cancel_pane_drag();
 				self.forward_focus(false);
 				0
 			}
@@ -534,6 +664,7 @@ impl App {
 		self.handle_mcp();
 		self.mark_seen();
 		self.sync_owner_to_mode();
+		self.step_pane_drag();
 		self.paint();
 	}
 
@@ -570,7 +701,15 @@ impl App {
 	}
 
 	fn content_area(&self) -> Rect {
-		Rect::new(0, 0, self.width, (self.height - self.canvas.cell_h).max(1))
+		// The reference config sets window-padding-x/y = 10; the pane grid keeps
+		// that margin, the status bar stays full width underneath it.
+		const PAD: i32 = 10;
+		Rect::new(
+			PAD,
+			PAD,
+			(self.width - PAD).max(PAD + 1),
+			(self.height - self.canvas.cell_h).max(PAD + 1),
+		)
 	}
 
 	/// The tiled area in terminal cells, which is what layout geometry counts.
@@ -692,7 +831,7 @@ impl App {
 						.map(|(_, cells)| *cells)
 						.unwrap_or((base_w, base_h));
 					pane.cell = (cw.max(1), ch.max(1));
-					resize_body(&mut pane.body, &rect, cw.max(1), ch.max(1));
+					resize_body(&mut pane.body, &pane_content(rect), cw.max(1), ch.max(1));
 				}
 			}
 		}
@@ -1350,6 +1489,12 @@ impl App {
 			// Alt+F4 goes to the system.
 			return false;
 		}
+		if key.down && key.vk == 0x7b {
+			// The window has no title bar, so F12 is its close button; it asks
+			// the same questions a click on that button would.
+			self.request_close_app();
+			return true;
+		}
 		if self.modal.is_some() {
 			if key.down {
 				self.modal_key(key);
@@ -1359,6 +1504,16 @@ impl App {
 		if self.scroll_mode {
 			if key.down {
 				self.scroll_key(key);
+			}
+			return true;
+		}
+		if self.pane_drag.is_some() {
+			// Esc puts the window back. Letting go of Alt also cancels, so a
+			// half-done drag cannot land on whatever is under the cursor. The
+			// explicit key-up test covers the Alt release itself, whose message
+			// may still report Alt as down.
+			if (key.down && key.vk == VK_ESCAPE) || !key.alt || (key.vk == VK_MENU && !key.down) {
+				self.cancel_pane_drag();
 			}
 			return true;
 		}
@@ -1742,7 +1897,7 @@ impl App {
 	fn caret_pixel(&self) -> Option<(i32, i32)> {
 		let id = self.focused_id()?;
 		let pane = self.pane(id)?;
-		let rect = self.pane_rect(id)?;
+		let rect = pane_content(self.pane_rect(id)?);
 		let (cw, ch) = (pane.cell.0.max(1), pane.cell.1.max(1));
 		match &pane.body {
 			Body::Term(term) => {
@@ -1786,14 +1941,15 @@ impl App {
 	}
 
 	fn cell_of(&self, id: PaneId, x: i32, y: i32) -> Option<(usize, usize, bool)> {
-		let rect = self.pane_rect(id)?;
+		let rect = pane_content(self.pane_rect(id)?);
 		let pane = self.pane(id)?;
 		let Body::Term(term) = &pane.body else {
 			return None;
 		};
 		let cw = pane.cell.0.max(1);
 		let ch = pane.cell.1.max(1);
-		let col = ((x - rect.left) / cw).max(0) as usize;
+		let cols = ((rect.width() / cw).max(1) as usize).saturating_sub(1);
+		let col = (((x - rect.left) / cw).max(0) as usize).min(cols);
 		let row = ((y - rect.top) / ch).max(0) as usize;
 		Some((term.view_top() + row, col, term.alt))
 	}
@@ -1802,6 +1958,32 @@ impl App {
 		let Some(id) = self.mouse_target(x, y) else {
 			return;
 		};
+		// Alt+left drags the whole window in normal/agent; plain drag keeps
+		// selecting text, and insert/share leave the mouse to the program.
+		let alt = unsafe { GetKeyState(VK_MENU as i32) < 0 };
+		if alt && !self.scroll_mode && self.mode == Mode::Normal && self.modal.is_none() {
+			if self.focused_id() != Some(id) {
+				self.focus_pane(id);
+				self.note_human(id);
+			}
+			if let Some(pane) = self.pane_mut(id) {
+				pane.ai_created = false;
+			}
+			self.pane_drag = Some(PaneDrag {
+				pane: id,
+				start: (x, y),
+				at: (x, y),
+				active: false,
+				drop: None,
+				zone: None,
+				zone_v: [0.0; 4],
+			});
+			unsafe {
+				SetCapture(self.hwnd);
+			}
+			self.ime_position(self.hwnd);
+			return;
+		}
 		let already_focused = self.focused_id() == Some(id);
 		self.focus_pane(id);
 		if !already_focused {
@@ -1903,6 +2085,34 @@ impl App {
 	}
 
 	fn mouse_move(&mut self, x: i32, y: i32) {
+		if let Some(pane) = self.pane_drag.as_ref().map(|d| d.pane) {
+			let mut became_active = false;
+			if let Some(drag) = &mut self.pane_drag {
+				drag.at = (x, y);
+				if !drag.active {
+					let dx = x - drag.start.0;
+					let dy = y - drag.start.1;
+					if dx * dx + dy * dy >= 16 {
+						drag.active = true;
+						became_active = true;
+					}
+				}
+			}
+			if became_active && self.zoomed() {
+				// Rearranging needs every window on screen, so the first real
+				// movement drops the zoom.
+				self.unzoom_active();
+			}
+			let drop = if self.pane_drag.as_ref().is_some_and(|d| d.active) {
+				self.drop_target(pane, x, y)
+			} else {
+				None
+			};
+			if let Some(drag) = &mut self.pane_drag {
+				drag.drop = drop;
+			}
+			return;
+		}
 		let Some(id) = self.drag.as_ref().map(|d| d.pane) else {
 			return;
 		};
@@ -1971,6 +2181,23 @@ impl App {
 	}
 
 	fn mouse_up(&mut self, x: i32, y: i32) {
+		if let Some(drag) = self.pane_drag.take() {
+			// Alt is the whole gesture; if it went up before the button, the
+			// release is not a drop.
+			let alt = unsafe { GetKeyState(VK_MENU as i32) < 0 };
+			let drop = if alt && drag.active {
+				self.drop_target(drag.pane, x, y)
+			} else {
+				None
+			};
+			if let Some(drop) = drop {
+				self.drop_pane(drag.pane, drop.0, drop.1);
+			}
+			unsafe {
+				ReleaseCapture();
+			}
+			return;
+		}
 		if let Some(drag) = self.drag.take() {
 			let insert = self.mode == Mode::Insert;
 			let reporting = self
@@ -1996,6 +2223,110 @@ impl App {
 		}
 	}
 
+	/// Moves the highlighted drop area toward the part it now names. Its
+	/// spring is underdamped on purpose: changing side overshoots a little and
+	/// settles, which is the jelly the gesture promised. The window picture
+	/// itself is painted at the pointer with no lag.
+	fn step_pane_drag(&mut self) {
+		let keep = self
+			.pane_drag
+			.as_ref()
+			.is_some_and(|d| self.pane(d.pane).is_some());
+		if !keep {
+			if self.pane_drag.take().is_some() {
+				unsafe {
+					ReleaseCapture();
+				}
+			}
+			return;
+		}
+		let Some(drag) = &self.pane_drag else {
+			return;
+		};
+		if !drag.active {
+			return;
+		}
+		let want = drag
+			.drop
+			.and_then(|(id, zone)| self.pane_rect(id).map(|rect| preview_rect(rect, zone)));
+		let Some(drag) = &mut self.pane_drag else {
+			return;
+		};
+		let Some(rect) = want else {
+			drag.zone = None;
+			return;
+		};
+		let target = [
+			rect.left as f32,
+			rect.top as f32,
+			rect.right as f32,
+			rect.bottom as f32,
+		];
+		match &mut drag.zone {
+			None => drag.zone = Some(target),
+			Some(cur) => spring_zone(cur, &mut drag.zone_v, target),
+		}
+	}
+
+	/// Drops the drag without touching the layout; Esc, a released Alt and a
+	/// lost window all end this way.
+	fn cancel_pane_drag(&mut self) {
+		if self.pane_drag.take().is_some() {
+			unsafe {
+				ReleaseCapture();
+			}
+		}
+	}
+
+	/// The pane and the half of it under the cursor that a release would land
+	/// on. The dragged pane itself and the separators have no zone, and a half
+	/// with no room for a split is not offered either.
+	fn drop_target(&self, pane: PaneId, x: i32, y: i32) -> Option<(PaneId, DropZone)> {
+		let id = self.mouse_target(x, y)?;
+		if id == pane {
+			return None;
+		}
+		let rect = self.pane_rect(id)?;
+		let zone = drop_zone(rect, x, y);
+		let dir = match zone {
+			DropZone::Left | DropZone::Right => Dir::Right,
+			DropZone::Top | DropZone::Bottom => Dir::Down,
+			DropZone::Center => return Some((id, zone)),
+		};
+		// Ask the same question the drop will ask, on a copy: by then the held
+		// pane is out of the tree, which can give the target the room it needs.
+		let mut probe = self.tabs.get(self.active)?.layout.clone();
+		probe.destroy(pane);
+		if !probe.can_split(id, dir) {
+			return None;
+		}
+		Some((id, zone))
+	}
+
+	/// layout_swap / move_to on the tab the drag started in. A side drop takes
+	/// the dragged pane out and splits the target, so the two share the target's
+	/// space; a centre drop only trades places and leaves the sizes alone.
+	fn drop_pane(&mut self, pane: PaneId, target: PaneId, zone: DropZone) {
+		let active = self.active;
+		let Some(tab) = self.tabs.get_mut(active) else {
+			return;
+		};
+		if !tab.panes.contains_key(&pane) || !tab.panes.contains_key(&target) {
+			return;
+		}
+		let moved = match zone {
+			DropZone::Center => tab.layout.swap(pane, target),
+			DropZone::Left => tab.layout.move_to(pane, target, Dir::Right, true),
+			DropZone::Right => tab.layout.move_to(pane, target, Dir::Right, false),
+			DropZone::Top => tab.layout.move_to(pane, target, Dir::Down, true),
+			DropZone::Bottom => tab.layout.move_to(pane, target, Dir::Down, false),
+		};
+		if moved {
+			tab.focus = pane;
+			self.resize_panes();
+		}
+	}
+
 	fn mouse_double(&mut self, x: i32, y: i32) {
 		let Some(id) = self.mouse_target(x, y) else {
 			return;
@@ -2011,9 +2342,10 @@ impl App {
 	}
 
 	fn screen_cell(&self, id: PaneId, x: i32, y: i32) -> Option<(usize, usize)> {
-		let rect = self.pane_rect(id)?;
+		let outer = self.pane_rect(id)?;
+		let rect = pane_content(outer);
 		let pane = self.pane(id)?;
-		if x < rect.left || y < rect.top || x >= rect.right || y >= rect.bottom {
+		if x < outer.left || y < outer.top || x >= outer.right || y >= outer.bottom {
 			return None;
 		}
 		let cw = pane.cell.0.max(1);
@@ -2025,7 +2357,7 @@ impl App {
 	}
 
 	fn body_cells(&self, id: PaneId) -> Option<(usize, usize)> {
-		let rect = self.pane_rect(id)?;
+		let rect = pane_content(self.pane_rect(id)?);
 		let pane = self.pane(id)?;
 		let cw = pane.cell.0.max(1);
 		let ch = pane.cell.1.max(1);
@@ -2102,7 +2434,7 @@ impl App {
 		release: bool,
 		motion: bool,
 	) -> bool {
-		let Some(rect) = self.pane_rect(id) else {
+		let Some(rect) = self.pane_rect(id).map(pane_content) else {
 			return false;
 		};
 		let Some(pane) = self.pane(id) else {
@@ -2117,8 +2449,10 @@ impl App {
 		}
 		let cw = pane.cell.0.max(1);
 		let ch = pane.cell.1.max(1);
-		let cx = (((x - rect.left) / cw) + 1).clamp(1, 1000) as i32;
-		let cy = (((y - rect.top) / ch) + 1).clamp(1, 1000) as i32;
+		let cols = ((rect.width() / cw).max(1) as i32).min(1000);
+		let rows = ((rect.height() / ch).max(1) as i32).min(1000);
+		let cx = (((x - rect.left) / cw) + 1).clamp(1, cols);
+		let cy = (((y - rect.top) / ch) + 1).clamp(1, rows);
 		let mut b = button;
 		if motion {
 			b += 32;
@@ -3158,8 +3492,9 @@ impl App {
 						String::from("  o odd  e even  s 选文件开 solid"),
 						String::from("  Ctrl+方向键调大小  Ctrl+= / Ctrl+- / Ctrl+滚轮 放大缩小窗口字体"),
 						String::from("  Ctrl+C 复制选区  Ctrl+V 粘贴"),
+						String::from("  F12 关闭窗口（和 Alt+F4 一样，有未保存或占用先拦下）"),
 						String::from(
-							"输入（share 同）：只有 F1-F12 留在 Delta（F1 回普通，F2-F12 暂无作用），",
+							"输入（share 同）：只有 F1-F12 留在 Delta（F1 回普通，F12 关闭窗口，F2-F11 暂无作用），",
 						),
 						String::from("  其余按键和鼠标原样交给程序"),
 						String::from("  solid：Ctrl+A 全选  Ctrl+C 复制  Ctrl+X 剪切  Ctrl+V 粘贴"),
@@ -3174,7 +3509,10 @@ impl App {
 							"       粘贴图片写成 ![](临时路径)；Ctrl+单击图片路径或网址用系统默认程序打开",
 						),
 						String::from("  终端：Ctrl+C 等由前台程序自己决定；选字和滚历史回普通模式"),
-						String::from("鼠标：普通里拖动选字、滚轮看历史、Ctrl+滚轮缩放窗口；输入里拖动、滚轮交给程序"),
+						String::from("鼠标：普通里拖动选字、滚轮看历史、Ctrl+滚轮缩放窗口；输入里拖动交给程序，滚轮程序要了就给程序、没要就自己滚历史"),
+						String::from(
+							"  Alt+左键拖窗口：拖到另一窗口边缘分成两半，拖到中间换位置；Esc 取消",
+						),
 						String::from(
 							"接管：读窗口不用申请；写入/接管要窗口归属或人批准；批准会记住",
 						),
@@ -3288,8 +3626,13 @@ impl App {
 		let ch = self.canvas.cell_h;
 		let area = self.content_area();
 		self.canvas.clear();
-		self.canvas
-			.fill(0, 0, self.width, self.height, canvas::rgb(28, 30, 40));
+		self.canvas.fill(
+			0,
+			0,
+			self.width,
+			self.height,
+			canvas::rgb_tuple(canvas::DEFAULT_BG),
+		);
 		let active = self.active;
 		let drawn = self
 			.tabs
@@ -3307,10 +3650,11 @@ impl App {
 				// on the base grid so Ctrl+= grows one window without moving borders.
 				canvas.select_font(pane.font);
 				let focused = *id == focus;
+				let inner = pane_content(*rect);
 				match &mut pane.body {
-					Body::Term(term) => term.render(canvas, *rect, focused, show_cursor, None),
-					Body::Solid(editor) => editor.render(canvas, *rect, focused, show_cursor),
-					Body::Even(group) => group.render(canvas, *rect, focused),
+					Body::Term(term) => term.render(canvas, inner, focused, show_cursor, None),
+					Body::Solid(editor) => editor.render(canvas, inner, focused, show_cursor),
+					Body::Even(group) => group.render(canvas, inner, focused),
 				}
 			}
 			canvas.select_font(canvas::FONT_SIZE);
@@ -3334,12 +3678,25 @@ impl App {
 				if held_by_ai {
 					// A 1-pixel line disappears on the dark background; an unfocused AI
 					// pane must still show whose it is, so the owner band is 3 pixels.
-					canvas.fill(rect.left, rect.top, rect.right, rect.top + 3, color);
-					canvas.fill(rect.left, rect.bottom - 3, rect.right, rect.bottom, color);
-					canvas.fill(rect.left, rect.top, rect.left + 3, rect.bottom, color);
-					canvas.fill(rect.right - 3, rect.top, rect.right, rect.bottom, color);
+					canvas.round_outline(
+						rect.left,
+						rect.top,
+						rect.right - 1,
+						rect.bottom - 1,
+						6,
+						3,
+						color,
+					);
 				} else {
-					canvas.outline(rect.left, rect.top, rect.right - 1, rect.bottom - 1, color);
+					canvas.round_outline(
+						rect.left,
+						rect.top,
+						rect.right - 1,
+						rect.bottom - 1,
+						6,
+						1,
+						color,
+					);
 				}
 				if focused && held_by_ai {
 					// The owner band says who holds the pane, the inner line says it still
@@ -3349,25 +3706,34 @@ impl App {
 						canvas::BORDER_ACTIVE.1,
 						canvas::BORDER_ACTIVE.2,
 					);
-					canvas.outline(
+					canvas.round_outline(
 						rect.left + 4,
 						rect.top + 4,
 						rect.right - 5,
 						rect.bottom - 5,
+						4,
+						1,
 						accent,
 					);
 				}
 				if self.show_numbers {
 					let label = format!(" {} ", id);
 					let width = label.len() as i32 * cw;
-					canvas.fill(
+					canvas.round_rect(
 						rect.left,
 						rect.top,
 						rect.left + width,
 						rect.top + ch,
-						canvas::rgb(60, 70, 90),
+						3,
+						canvas::rgb_tuple(canvas::BLUE),
+						None,
 					);
-					canvas.text(rect.left, rect.top, &label, canvas::rgb(240, 240, 240));
+					canvas.text(
+						rect.left,
+						rect.top,
+						&label,
+						canvas::rgb_tuple(canvas::BASE),
+					);
 				}
 				if held_by_ai {
 					let label = match &pane.owner {
@@ -3379,24 +3745,160 @@ impl App {
 					let label = clip_text(&label, room);
 					let width = label.width() as i32 * cw;
 					let x = (rect.right - width).max(rect.left);
-					canvas.fill(x, rect.top, rect.right, rect.top + ch, color);
-					canvas.text(x, rect.top, &label, canvas::rgb(20, 16, 26));
+					canvas.round_rect(
+						x,
+						rect.top,
+						rect.right,
+						rect.top + ch,
+						3,
+						color,
+						None,
+					);
+					canvas.text(x, rect.top, &label, canvas::rgb_tuple(canvas::BASE));
 				}
 			}
 		}
+		self.draw_pane_drag();
 		if let Some((x, y)) = self.ime_caret {
 			if !self.ime_text.is_empty() {
 				let text = clip_text(&self.ime_text, 40);
 				let width = text.width() as i32 * cw;
+				self.canvas.round_rect(
+					x,
+					y,
+					x + width,
+					y + ch,
+					3,
+					canvas::rgb_tuple(canvas::SURFACE0),
+					Some(canvas::rgb_tuple(canvas::SURFACE1)),
+				);
 				self.canvas
-					.fill(x, y, x + width, y + ch, canvas::rgb(60, 52, 30));
-				self.canvas.text(x, y, &text, canvas::rgb(240, 220, 170));
+					.text(x, y, &text, canvas::rgb_tuple(canvas::YELLOW));
 			}
 		}
 		self.draw_status();
 		self.draw_modal();
 		let hwnd = self.hwnd;
 		self.canvas.present(hwnd);
+	}
+
+	/// Alt+drag visuals: the drop area under the pointer is filled and framed,
+	/// and the lifted window follows the pointer as a small live picture of
+	/// itself. Everything is opaque, so the marks stay steady over moving
+	/// terminal content.
+	fn draw_pane_drag(&mut self) {
+		let Some(drag) = &self.pane_drag else {
+			return;
+		};
+		if !drag.active {
+			return;
+		}
+		let (pane, drop, at, zone) = (drag.pane, drag.drop, drag.at, drag.zone);
+		let Some(src) = self.pane_rect(pane) else {
+			return;
+		};
+		if let (Some((_, side)), Some(z)) = (drop, zone) {
+			let color = if side == DropZone::Center {
+				canvas::MAUVE
+			} else {
+				canvas::BLUE
+			};
+			self.canvas.round_rect(
+				z[0].round() as i32,
+				z[1].round() as i32,
+				z[2].round() as i32,
+				z[3].round() as i32,
+				4,
+				canvas::rgb_tuple(canvas::SURFACE0),
+				Some(canvas::rgb_tuple(color)),
+			);
+		}
+		self.draw_pane_thumb(pane, src, at);
+	}
+
+	/// The dragged window as a small live picture, with its number and title on
+	/// a strip above it. It sits next to the pointer and flips to the other
+	/// side of it near an edge, so it is never cut off.
+	fn draw_pane_thumb(&mut self, pane: PaneId, src: Rect, at: (i32, i32)) {
+		let cw = self.canvas.cell_w.max(1);
+		let ch = self.canvas.cell_h.max(1);
+		let scale = (220.0 / src.width().max(1) as f32)
+			.min(140.0 / src.height().max(1) as f32)
+			.min(0.55);
+		let tw = ((src.width() as f32 * scale) as i32).clamp(24, 220);
+		let th = ((src.height() as f32 * scale) as i32).clamp(16, 140);
+		let card_h = th + ch;
+		let max_x = (self.width - tw - 4).max(2);
+		let max_y = (self.height - card_h - 4).max(2);
+		let mut x = at.0 + 16;
+		let mut y = at.1 + 16;
+		if x > max_x {
+			x = (at.0 - tw - 16).max(2);
+		}
+		if y > max_y {
+			y = (at.1 - card_h - 16).max(2);
+		}
+		let (x, y) = (x.clamp(2, max_x), y.clamp(2, max_y));
+		self.canvas
+			.stretch_from(src.left, src.top, src.right, src.bottom, x, y + ch, tw, th);
+		self.canvas.round_rect(
+			x,
+			y,
+			x + tw,
+			y + ch,
+			3,
+			canvas::rgb_tuple(canvas::SURFACE0),
+			None,
+		);
+		self.canvas.round_outline(
+			x,
+			y,
+			x + tw - 1,
+			y + card_h - 1,
+			4,
+			2,
+			canvas::rgb_tuple(canvas::OVERLAY1),
+		);
+		let title = self.pane(pane).map(Self::pane_title).unwrap_or_default();
+		let label = clip_text(&format!(" {pane} {title} "), (tw / cw).max(1) as usize);
+		self.canvas
+			.text(x, y, &label, canvas::rgb_tuple(canvas::TEXT));
+	}
+
+	/// One lualine-style section: a pill with its own background. Returns the
+	/// right edge, so sections can be laid out one after another.
+	fn status_chip(
+		&mut self,
+		x: i32,
+		text: &str,
+		fill: (u8, u8, u8),
+		line: Option<(u8, u8, u8)>,
+		fg: (u8, u8, u8),
+	) -> i32 {
+		let cw = self.canvas.cell_w;
+		let ch = self.canvas.cell_h;
+		let pad = (cw / 2).max(3);
+		let top = self.height - ch + 2;
+		let bottom = self.height - 2;
+		let radius = ((ch - 4) / 2).max(2);
+		let width = self.status_chip_width(text);
+		self.canvas.round_rect(
+			x,
+			top,
+			x + width,
+			bottom,
+			radius,
+			canvas::rgb_tuple(fill),
+			line.map(canvas::rgb_tuple),
+		);
+		self.canvas
+			.text(x + pad, self.height - ch, text, canvas::rgb_tuple(fg));
+		x + width
+	}
+
+	fn status_chip_width(&self, text: &str) -> i32 {
+		let cw = self.canvas.cell_w;
+		text.width() as i32 * cw + 2 * (cw / 2).max(3)
 	}
 
 	fn draw_status(&mut self) {
@@ -3408,65 +3910,28 @@ impl App {
 			y,
 			self.width,
 			self.height,
-			canvas::rgb(
-				canvas::STATUS_BG.0,
-				canvas::STATUS_BG.1,
-				canvas::STATUS_BG.2,
-			),
+			canvas::rgb_tuple(canvas::STATUS_BG),
 		);
-		let mut x = 0i32;
-		for index in 0..self.tabs.len() {
-			let label = format!(" {} {} ", index + 1, self.tab_title(index));
-			let width = label.width() as i32 * cw;
-			if x + width > self.width - 260 {
-				break;
-			}
-			if index == self.active {
-				self.canvas.fill(
-					x,
-					y,
-					x + width,
-					y + ch,
-					canvas::rgb(canvas::ACCENT.0, canvas::ACCENT.1, canvas::ACCENT.2),
-				);
-				self.canvas.text(x, y, &label, canvas::rgb(10, 12, 16));
-			} else {
-				self.canvas.text(
-					x,
-					y,
-					&label,
-					canvas::rgb(
-						canvas::STATUS_FG.0,
-						canvas::STATUS_FG.1,
-						canvas::STATUS_FG.2,
-					),
-				);
-			}
-			x += width;
-		}
 		let pane = self.focused();
 		// The mode field holds one of four window modes: normal, insert, agent,
 		// share. Agent and share belong to the AI and carry its name.
 		let owner_mode = pane.and_then(|p| match &p.owner {
-			Owner::Agent(agent) => Some((
-				format!("agent {}", agent_badge(agent)),
-				owner_color(&p.owner),
-			)),
-			Owner::Share(agent) => Some((
-				format!("share {}", agent_badge(agent)),
-				owner_color(&p.owner),
-			)),
+			Owner::Agent(agent) => Some((format!("agent {}", agent_badge(agent)), canvas::MAUVE)),
+			Owner::Share(agent) => Some((format!("share {}", agent_badge(agent)), canvas::GREEN)),
 			Owner::Normal => None,
 		});
 		let (mode_label, mode_color) = match (owner_mode, self.scroll_mode) {
-			(Some((label, color)), _) => (label, Some(color)),
-			(None, true) => (String::from("SCROLL"), None),
+			(Some((label, color)), _) => (label, color),
+			(None, true) => (String::from("SCROLL"), canvas::PEACH),
 			(None, false) => (
 				String::from(match self.mode {
 					Mode::Normal => "NORMAL",
 					Mode::Insert => "INSERT",
 				}),
-				None,
+				match self.mode {
+					Mode::Normal => canvas::BLUE,
+					Mode::Insert => canvas::GREEN,
+				},
 			),
 		};
 		let zoom = self
@@ -3474,23 +3939,89 @@ impl App {
 			.get(self.active)
 			.map(|t| t.saved.is_some())
 			.unwrap_or(false);
-		let prefix = format!("{mode_label}  ");
-		let tail = format!(
-			"tab {}/{}  pane {}{} ",
-			self.active + 1,
-			self.tabs.len(),
-			self.focused_id().unwrap_or(0),
-			if zoom { "  ZOOM" } else { "" }
+		let pad = (cw / 2).max(3);
+		let gap = (cw / 2).max(4);
+		// Right-hand sections first, so the tab row knows where it must stop.
+		let pane_text = format!("pane {}", self.focused_id().unwrap_or(0));
+		let tab_text = format!("tab {}/{}", self.active + 1, self.tabs.len());
+		let mut right = self.width - 6 - self.status_chip_width(&tab_text);
+		self.status_chip(
+			right,
+			&tab_text,
+			canvas::STATUS_BG,
+			Some(canvas::SURFACE1),
+			canvas::SUBTEXT0,
 		);
-		let right = format!("{prefix}{tail}");
-		let width = right.width() as i32 * cw;
-		let x = (self.width - width - 4).max(0);
-		let accent = canvas::rgb(canvas::ACCENT.0, canvas::ACCENT.1, canvas::ACCENT.2);
-		self.canvas.text(x, y, &right, accent);
-		if let Some(color) = mode_color {
-			let label_w = mode_label.width() as i32 * cw;
-			self.canvas.fill(x, y, x + label_w, y + ch, color);
-			self.canvas.text(x, y, &mode_label, canvas::rgb(20, 16, 26));
+		right -= gap + self.status_chip_width(&pane_text);
+		self.status_chip(
+			right,
+			&pane_text,
+			canvas::STATUS_BG,
+			Some(canvas::SURFACE1),
+			canvas::SUBTEXT0,
+		);
+		let mut tabs_stop = right - gap;
+		if zoom {
+			let zoom_x = tabs_stop - self.status_chip_width("ZOOM");
+			self.status_chip(zoom_x, "ZOOM", canvas::PEACH, None, canvas::BASE);
+			tabs_stop = zoom_x - gap;
+		}
+		let mut x = 6;
+		x = self.status_chip(x, &mode_label, mode_color, None, canvas::BASE) + gap;
+		// Tab badges cycle the same accents the reference uses for its chips.
+		let accents = [
+			canvas::BLUE,
+			canvas::MAUVE,
+			canvas::PEACH,
+			canvas::GREEN,
+			canvas::PINK,
+			canvas::TEAL,
+		];
+		for index in 0..self.tabs.len() {
+			let title = self.tab_title(index);
+			let badge = format!("{}", index + 1);
+			let badge_w = cw + pad * 2;
+			let title_w = title.width() as i32 * cw;
+			let title_x = x + pad + badge_w + pad;
+			let chip_right = title_x + title_w + pad;
+			if chip_right + gap > tabs_stop {
+				break;
+			}
+			if index == self.active {
+				// The current window is the raised tile, not an underline.
+				self.canvas.round_rect(
+					x,
+					y + 2,
+					chip_right,
+					y + ch - 2,
+					(ch / 3).max(4),
+					canvas::rgb_tuple(canvas::SURFACE0),
+					None,
+				);
+			}
+			let accent = accents[index % accents.len()];
+			self.canvas.round_rect(
+				x + pad,
+				y + 2,
+				x + pad + badge_w,
+				y + ch - 2,
+				((ch - 4) / 2).max(2),
+				canvas::rgb_tuple(accent),
+				None,
+			);
+			self.canvas.text(
+				x + pad * 2,
+				y,
+				&badge,
+				canvas::rgb_tuple(canvas::BASE),
+			);
+			let fg = if index == self.active {
+				canvas::rgb_tuple(canvas::TEXT)
+			} else {
+				canvas::rgb_tuple(canvas::SUBTEXT0)
+			};
+			self.canvas.text(title_x, y, &title, fg);
+			x = chip_right + gap;
 		}
 	}
 
@@ -3519,18 +4050,22 @@ impl App {
 		let box_h = ((wrapped.len() + 3) as i32 * ch).min(self.height - 20);
 		let x = (self.width - box_w) / 2;
 		let y = (self.height - box_h) / 2;
-		self.canvas
-			.fill(x, y, x + box_w, y + box_h, canvas::rgb(20, 22, 30));
-		self.canvas.outline(
+		self.canvas.round_rect(
 			x,
 			y,
 			x + box_w,
 			y + box_h,
+			8,
 			canvas::rgb(
+				canvas::DEFAULT_BG.0,
+				canvas::DEFAULT_BG.1,
+				canvas::DEFAULT_BG.2,
+			),
+			Some(canvas::rgb(
 				canvas::BORDER_ACTIVE.0,
 				canvas::BORDER_ACTIVE.1,
 				canvas::BORDER_ACTIVE.2,
-			),
+			)),
 		);
 		self.canvas.text(
 			x + cw,
@@ -3571,18 +4106,22 @@ impl App {
 		let box_h = (((3 + fixed + PANE_LIST_ROWS) as i32) * ch).min(self.height - 20);
 		let x = (self.width - box_w) / 2;
 		let y = (self.height - box_h) / 2;
-		self.canvas
-			.fill(x, y, x + box_w, y + box_h, canvas::rgb(20, 22, 30));
-		self.canvas.outline(
+		self.canvas.round_rect(
 			x,
 			y,
 			x + box_w,
 			y + box_h,
+			8,
 			canvas::rgb(
+				canvas::DEFAULT_BG.0,
+				canvas::DEFAULT_BG.1,
+				canvas::DEFAULT_BG.2,
+			),
+			Some(canvas::rgb(
 				canvas::BORDER_ACTIVE.0,
 				canvas::BORDER_ACTIVE.1,
 				canvas::BORDER_ACTIVE.2,
-			),
+			)),
 		);
 		self.canvas.text(
 			x + cw,
@@ -3654,6 +4193,22 @@ fn default_shell() -> String {
 		.unwrap_or_else(|| String::from("odd.exe"))
 }
 
+/// Space between a pane's frame line and its content, in pixels. The frame and
+/// the hit area keep the full cell-aligned pane rect; text, the caret and the
+/// cells the program is told about all start inside this smaller rect.
+const PANE_PAD: i32 = 6;
+
+fn pane_content(rect: Rect) -> Rect {
+	let left = rect.left + PANE_PAD;
+	let top = rect.top + PANE_PAD;
+	Rect::new(
+		left,
+		top,
+		(rect.right - PANE_PAD).max(left + 1),
+		(rect.bottom - PANE_PAD).max(top + 1),
+	)
+}
+
 fn resize_body(body: &mut Body, rect: &Rect, cw: i32, ch: i32) {
 	if let Body::Term(term) = body {
 		let cols = (rect.width() / cw).max(1) as usize;
@@ -3716,9 +4271,59 @@ fn agent_badge(agent: &str) -> String {
 
 fn owner_color(owner: &Owner) -> u32 {
 	match owner {
-		Owner::Normal => canvas::rgb(canvas::BORDER.0, canvas::BORDER.1, canvas::BORDER.2),
-		Owner::Agent(_) => canvas::rgb(150, 110, 200),
-		Owner::Share(_) => canvas::rgb(110, 180, 130),
+		Owner::Normal => canvas::rgb_tuple(canvas::BORDER),
+		Owner::Agent(_) => canvas::rgb_tuple(canvas::MAUVE),
+		Owner::Share(_) => canvas::rgb_tuple(canvas::GREEN),
+	}
+}
+
+/// The outer 30% of a pane is what a drop splits; the middle trades places.
+fn drop_zone(rect: Rect, x: i32, y: i32) -> DropZone {
+	let fx = (x - rect.left) as f32 / rect.width().max(1) as f32;
+	let fy = (y - rect.top) as f32 / rect.height().max(1) as f32;
+	const BAND: f32 = 0.3;
+	let (mut zone, mut best) = (DropZone::Center, BAND);
+	if fx < best {
+		best = fx;
+		zone = DropZone::Left;
+	}
+	if 1.0 - fx < best {
+		best = 1.0 - fx;
+		zone = DropZone::Right;
+	}
+	if fy < best {
+		best = fy;
+		zone = DropZone::Top;
+	}
+	if 1.0 - fy < best {
+		zone = DropZone::Bottom;
+	}
+	zone
+}
+
+/// The half of a pane a side drop would take over; the whole pane for a swap.
+fn preview_rect(rect: Rect, zone: DropZone) -> Rect {
+	let half_w = (rect.width() / 2).max(1);
+	let half_h = (rect.height() / 2).max(1);
+	match zone {
+		DropZone::Left => Rect::new(rect.left, rect.top, rect.left + half_w, rect.bottom),
+		DropZone::Right => Rect::new(rect.right - half_w, rect.top, rect.right, rect.bottom),
+		DropZone::Top => Rect::new(rect.left, rect.top, rect.right, rect.top + half_h),
+		DropZone::Bottom => Rect::new(rect.left, rect.bottom - half_h, rect.right, rect.bottom),
+		DropZone::Center => rect,
+	}
+}
+
+/// One step of the underdamped spring that slides the drop area to its new
+/// side instead of letting it jump.
+fn spring_zone(cur: &mut [f32; 4], vel: &mut [f32; 4], target: [f32; 4]) {
+	for i in 0..4 {
+		vel[i] = vel[i] * 0.55 + (target[i] - cur[i]) * 0.55;
+		cur[i] += vel[i];
+		if (target[i] - cur[i]).abs() < 0.3 && vel[i].abs() < 0.3 {
+			cur[i] = target[i];
+			vel[i] = 0.0;
+		}
 	}
 }
 
@@ -3783,6 +4388,11 @@ fn wrap_text(text: &str, cols: usize) -> Vec<String> {
 		out.push(current);
 	}
 	out
+}
+
+/// 无标题栏的窗口不再有系统边框，但最大化时系统仍按这个厚度把窗口撑出工作区。
+fn frame_width() -> i32 {
+	unsafe { GetSystemMetrics(SM_CXSIZEFRAME) + GetSystemMetrics(SM_CXPADDEDBORDER) }
 }
 
 fn point_of(lparam: LPARAM) -> (i32, i32) {
@@ -3883,5 +4493,46 @@ mod tests {
 		// A tab drawing a single window has to give that one up.
 		assert_eq!(lowest_priority(&[1], &prio, Some(1)), None);
 		assert_eq!(lowest_priority(&[1], &prio, None), Some(1));
+	}
+
+	#[test]
+	fn the_edge_bands_split_and_the_middle_swaps() {
+		let rect = Rect::new(100, 50, 300, 250);
+		assert_eq!(drop_zone(rect, 110, 150), DropZone::Left);
+		assert_eq!(drop_zone(rect, 290, 150), DropZone::Right);
+		assert_eq!(drop_zone(rect, 200, 60), DropZone::Top);
+		assert_eq!(drop_zone(rect, 200, 240), DropZone::Bottom);
+		assert_eq!(drop_zone(rect, 200, 150), DropZone::Center);
+		// A corner belongs to the nearer side.
+		assert_eq!(drop_zone(rect, 105, 55), DropZone::Left);
+		assert_eq!(drop_zone(rect, 295, 245), DropZone::Right);
+	}
+
+	#[test]
+	fn the_preview_covers_the_half_the_window_would_take() {
+		let rect = Rect::new(100, 50, 300, 250);
+		assert_eq!(preview_rect(rect, DropZone::Left), Rect::new(100, 50, 200, 250));
+		assert_eq!(
+			preview_rect(rect, DropZone::Right),
+			Rect::new(200, 50, 300, 250)
+		);
+		assert_eq!(preview_rect(rect, DropZone::Top), Rect::new(100, 50, 300, 150));
+		assert_eq!(
+			preview_rect(rect, DropZone::Bottom),
+			Rect::new(100, 150, 300, 250)
+		);
+		assert_eq!(preview_rect(rect, DropZone::Center), rect);
+	}
+
+	#[test]
+	fn the_drop_area_slides_to_its_new_side_and_stops() {
+		let mut cur = [100.0, 50.0, 200.0, 250.0];
+		let mut vel = [0.0; 4];
+		let target = [200.0, 50.0, 300.0, 250.0];
+		for _ in 0..240 {
+			spring_zone(&mut cur, &mut vel, target);
+		}
+		assert_eq!(cur, target);
+		assert_eq!(vel, [0.0; 4]);
 	}
 }
