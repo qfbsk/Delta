@@ -22,6 +22,7 @@ use windows_sys::Win32::Graphics::Gdi::{
 };
 use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
 use windows_sys::Win32::UI::Controls::Dialogs::{
 	GetOpenFileNameW, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST,
 	OPENFILENAMEW,
@@ -52,8 +53,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 	WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
 	WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCHITTEST, WM_PAINT,
 	WM_SETFOCUS, WM_SIZE, WM_SYSCHAR,
-	WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW, WS_CAPTION, WS_MAXIMIZEBOX, WS_MINIMIZEBOX,
-	WS_SYSMENU, WS_THICKFRAME, WS_VISIBLE,
+	WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW, WS_CAPTION, WS_EX_NOREDIRECTIONBITMAP,
+	WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME, WS_VISIBLE,
 };
 
 use crate::canvas::{self, Canvas};
@@ -210,6 +211,9 @@ pub struct App {
 	/// accumulate here until a whole notch is worth acting on.
 	wheel_accum: i32,
 	show_numbers: bool,
+	/// `v` in normal mode: draw spaces, tab stops and line breaks in every
+	/// window, the way the reference editor does.
+	show_whitespace: bool,
 	modal: Option<Modal>,
 	events: Vec<EventRecord>,
 	auth: HashMap<(PaneId, String), ()>,
@@ -261,8 +265,9 @@ pub fn run(shell: Option<String>, file: Option<PathBuf>) -> i32 {
 			return 1;
 		}
 		let title = canvas::wide("Delta");
+		let glass = glass_enabled();
 		let hwnd = CreateWindowExW(
-			0,
+			if glass { WS_EX_NOREDIRECTIONBITMAP } else { 0 },
 			class_name.as_ptr(),
 			title.as_ptr(),
 			// Delta 自己画整个窗口：粗边框留给拖边改大小，系统菜单留给 Alt+F4。
@@ -331,6 +336,11 @@ pub fn run(shell: Option<String>, file: Option<PathBuf>) -> i32 {
 				&none as *const u32 as *const std::ffi::c_void,
 				4,
 			);
+			// 整窗半透明模糊：DWM 在窗口背后画高斯模糊的亚克力背板，画布那一层
+			// 按合成视觉的透明度叠上去，桌面就从整块窗口里透出来。
+			if glass {
+				set_acrylic(hwnd, ACRYLIC_TINT);
+			}
 		}
 		ShowWindow(hwnd, SW_SHOW);
 		UpdateWindow(hwnd);
@@ -348,6 +358,79 @@ pub fn run(shell: Option<String>, file: Option<PathBuf>) -> i32 {
 		UnregisterClassW(class_name.as_ptr(), module);
 		0
 	}
+}
+
+/// Windows 关掉“透明效果”时不画亚克力背板，整窗模糊就只剩一片黑；这种情况
+/// 照旧走不透明的 GDI 呈现。
+fn glass_enabled() -> bool {
+	let path = canvas::wide("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize");
+	let name = canvas::wide("EnableTransparency");
+	let mut value: u32 = 1;
+	let mut size = std::mem::size_of::<u32>() as u32;
+	let status = unsafe {
+		RegGetValueW(
+			HKEY_CURRENT_USER,
+			path.as_ptr(),
+			name.as_ptr(),
+			RRF_RT_REG_DWORD,
+			null_mut(),
+			&mut value as *mut u32 as *mut std::ffi::c_void,
+			&mut size,
+		)
+	};
+	status != 0 || value != 0
+}
+
+#[repr(C)]
+struct AccentPolicy {
+	state: u32,
+	flags: u32,
+	gradient_color: u32,
+	animation_id: u32,
+}
+
+#[repr(C)]
+struct WindowCompositionAttributeData {
+	attribute: u32,
+	data: *mut std::ffi::c_void,
+	size: usize,
+}
+
+/// 亚克力背板的底色。系统背板（DWMWA_SYSTEMBACKDROP_TYPE）在这台机器上把桌面
+/// 洗成一片灰，所以背板只负责模糊，再压一层黑把它压暗：背后是亮窗口时，透出来
+/// 的也是暗的模糊，不会是灰。
+const ACRYLIC_TINT: u32 = 0x4D000000;
+
+fn set_acrylic(hwnd: HWND, color: u32) {
+	type SetWindowCompositionAttributeFn =
+		unsafe extern "system" fn(HWND, *mut WindowCompositionAttributeData) -> i32;
+	// user32 的导入库里没有这个未公开入口，只能按名字取。
+	let name = b"SetWindowCompositionAttribute\0";
+	let Some(call) = (unsafe {
+		use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+		let user32 = canvas::wide("user32.dll");
+		let module = GetModuleHandleW(user32.as_ptr());
+		if module.is_null() {
+			None
+		} else {
+			GetProcAddress(module, name.as_ptr())
+				.map(|proc| std::mem::transmute::<_, SetWindowCompositionAttributeFn>(proc))
+		}
+	}) else {
+		return;
+	};
+	let mut policy = AccentPolicy {
+		state: 4, // ACCENT_ENABLE_ACRYLICBLURBEHIND
+		flags: 0,
+		gradient_color: color,
+		animation_id: 0,
+	};
+	let mut data = WindowCompositionAttributeData {
+		attribute: 19, // WCA_ACCENT_POLICY
+		data: &mut policy as *mut AccentPolicy as *mut std::ffi::c_void,
+		size: std::mem::size_of::<AccentPolicy>(),
+	};
+	let _ = unsafe { call(hwnd, &mut data) };
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -409,6 +492,7 @@ impl App {
 			scroll_mode: false,
 			wheel_accum: 0,
 			show_numbers: false,
+			show_whitespace: false,
 			modal: None,
 			events: Vec::new(),
 			auth: HashMap::new(),
@@ -428,11 +512,11 @@ impl App {
 			ime_caret: None,
 			quit: false,
 		};
-		if let Some(path) = file {
-			app.open_editor(path);
-		}
 		if app.tabs.is_empty() {
 			app.new_terminal_tab();
+		}
+		if let Some(path) = file {
+			app.open_editor(path);
 		}
 		Ok(app)
 	}
@@ -622,6 +706,7 @@ impl App {
 			}
 			WM_DESTROY => {
 				self.quit = true;
+				crate::lsp::shutdown_all();
 				unsafe {
 					PostQuitMessage(0);
 				}
@@ -1067,7 +1152,7 @@ impl App {
 			self.focus_pane_anywhere(id);
 			return Some(id);
 		}
-		let editor = match Editor::open(path.clone(), false) {
+		let mut editor = match Editor::open(path.clone(), false) {
 			Ok(editor) => editor,
 			Err(err) => {
 				self.modal = Some(Modal::Notice(format!(
@@ -1077,6 +1162,7 @@ impl App {
 				return None;
 			}
 		};
+		editor.attach_lsp();
 		let id = self.next_pane;
 		self.next_pane += 1;
 		let tab = self.active;
@@ -1638,6 +1724,7 @@ impl App {
 			}
 			'!' => self.break_pane(),
 			'q' => self.show_numbers = !self.show_numbers,
+			'v' => self.show_whitespace = !self.show_whitespace,
 			'?' => self.modal = Some(Modal::Help),
 			'e' => {
 				self.open_group();
@@ -1916,7 +2003,8 @@ impl App {
 						crate::solid::char_cells(*c)
 					};
 				}
-				let col = visual.saturating_sub(editor.hscroll);
+				let gutter = editor.gutter_cells();
+				let col = visual.saturating_sub(editor.hscroll) + gutter;
 				Some((rect.left + col as i32 * cw, rect.top + row as i32 * ch))
 			}
 			Body::Even(group) => {
@@ -1991,8 +2079,16 @@ impl App {
 		}
 		// A click is the same click in every window: it lands on the control
 		// mode. Which control mode that is — normal or agent — is the owner's
-		// business, not the mouse's.
-		if !self.scroll_mode {
+		// business, not the mouse's. The one exception is a solid editor that
+		// already has the keyboard: clicking in the text is placing its caret,
+		// not leaving the typing mode, so the caret stays and the arrows keep
+		// moving it instead of moving the focus.
+		let placing_caret = already_focused
+			&& self.mode == Mode::Insert
+			&& self
+				.pane(id)
+				.is_some_and(|pane| matches!(&pane.body, Body::Solid(_)));
+		if !self.scroll_mode && !placing_caret {
 			self.mode = Mode::Normal;
 			self.sync_owner_to_mode();
 		}
@@ -3231,8 +3327,9 @@ impl App {
 						if let Some(id) = self.find_solid(&path) {
 							return Ok(json!({"text": format!("窗口 {id} 已经打开这个文件")}));
 						}
-						let editor = Editor::open(path, false)
+						let mut editor = Editor::open(path, false)
 							.map_err(|err| format!("文件没有打开：{err}"))?;
+						editor.attach_lsp();
 						let id = self.next_pane;
 						self.next_pane += 1;
 						self.add_tab(id, Body::Solid(editor), Owner::Normal, true, 0, None, false);
@@ -3518,7 +3615,7 @@ impl App {
 						),
 						String::from("关闭：有任务事件时拒绝并列出；AI 的窗口先停止任务"),
 						String::from(
-							"odd：默认终端就是 odd 本身；solid：终端里 \"$SOLID\" <文件> 或启动时带 <文件>",
+							"odd：默认终端就是 odd 本身；solid：终端里 @solid \"文件\"、\"$SOLID\" <文件>，或启动时带 <文件>",
 						),
 						format!("Delta MCP：{mcp}"),
 					],
@@ -3652,9 +3749,15 @@ impl App {
 				let focused = *id == focus;
 				let inner = pane_content(*rect);
 				match &mut pane.body {
-					Body::Term(term) => term.render(canvas, inner, focused, show_cursor, None),
-					Body::Solid(editor) => editor.render(canvas, inner, focused, show_cursor),
-					Body::Even(group) => group.render(canvas, inner, focused),
+					Body::Term(term) => {
+						term.render(canvas, inner, focused, show_cursor, None, self.show_whitespace)
+					}
+					Body::Solid(editor) => {
+						editor.render(canvas, inner, focused, show_cursor, self.show_whitespace)
+					}
+					Body::Even(group) => {
+						group.render(canvas, inner, focused, self.show_whitespace)
+					}
 				}
 			}
 			canvas.select_font(canvas::FONT_SIZE);

@@ -3,14 +3,15 @@
 //! but everything is drawn from the delta-vt grid each frame.
 
 use std::collections::HashMap;
-use std::mem::zeroed;
+use std::mem::{size_of, zeroed};
 use std::ptr::null_mut;
 
 use windows_sys::Win32::Foundation::SIZE;
 use windows_sys::Win32::Foundation::{COLORREF, HWND, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
-	BitBlt, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateCompatibleBitmap, CreateCompatibleDC,
-	CreateFontW, CreatePen, CreateSolidBrush, DEFAULT_CHARSET, DeleteDC, DeleteObject, FF_MODERN,
+	BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
+	CreateCompatibleBitmap, CreateCompatibleDC, CreateDIBSection, CreateFontW, CreatePen,
+	CreateSolidBrush, DEFAULT_CHARSET, DIB_RGB_COLORS, DeleteDC, DeleteObject, FF_MODERN,
 	FIXED_PITCH, FW_NORMAL, FillRect, GetDC, GetTextExtentPoint32W, HDC, HFONT, HGDIOBJ,
 	IntersectClipRect, HALFTONE, LineTo, MoveToEx, OUT_DEFAULT_PRECIS, PS_SOLID, Rectangle,
 	ReleaseDC, RestoreDC, RoundRect, SRCCOPY, SaveDC, SelectObject, SetBkMode,
@@ -23,6 +24,11 @@ use windows_sys::Win32::Graphics::GdiPlus::{
 	GdiplusStartup, GdiplusStartupInput, GpBrush, GpGraphics, GpPath, GpSolidFill,
 	SmoothingModeAntiAlias, UnitPixel,
 };
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+	GWL_EXSTYLE, GetWindowLongPtrW, WS_EX_NOREDIRECTIONBITMAP,
+};
+
+use crate::compose::Compositor;
 
 /// The size every pane starts at; status bar, borders and modals always use it.
 pub const FONT_SIZE: i32 = 16;
@@ -41,6 +47,10 @@ pub struct Canvas {
 	pub mem: HDC,
 	bmp: windows_sys::Win32::Graphics::Gdi::HBITMAP,
 	old: HGDIOBJ,
+	/// Top-down 32-bit pixels of `bmp`, straight to the compositor.
+	bits: *mut u8,
+	/// Present path for the glass window; `None` falls back to BitBlt.
+	compositor: Option<Compositor>,
 	/// GDI+ 也画在这块 DC 上；圆角靠它抗锯齿，GDI 的 RoundRect 是硬像素阶梯。
 	graphics: *mut GpGraphics,
 	gdiplus: usize,
@@ -78,6 +88,8 @@ impl Canvas {
 				mem,
 				bmp: null_mut(),
 				old: null_mut(),
+				bits: null_mut(),
+				compositor: None,
 				graphics,
 				gdiplus: token,
 				face: pick_font(),
@@ -174,7 +186,19 @@ impl Canvas {
 				return;
 			}
 			let mem = CreateCompatibleDC(screen);
-			let bmp = CreateCompatibleBitmap(screen, width, height);
+			// 32 位顶朝下：alpha 字节自己补，行序正好是交换链要的顺序。
+			let mut bmi: BITMAPINFO = zeroed();
+			bmi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
+			bmi.bmiHeader.biWidth = width;
+			bmi.bmiHeader.biHeight = -height;
+			bmi.bmiHeader.biPlanes = 1;
+			bmi.bmiHeader.biBitCount = 32;
+			bmi.bmiHeader.biCompression = BI_RGB;
+			let mut bits: *mut std::ffi::c_void = null_mut();
+			let mut bmp = CreateDIBSection(mem, &bmi, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
+			if bmp.is_null() {
+				bmp = CreateCompatibleBitmap(screen, width, height);
+			}
 			let old = SelectObject(mem, bmp);
 			if let Some(face) = self.faces.get(&self.font_size) {
 				SelectObject(mem, face.font as HGDIOBJ);
@@ -196,9 +220,17 @@ impl Canvas {
 			self.mem = mem;
 			self.bmp = bmp;
 			self.old = old;
+			self.bits = bits as *mut u8;
 			self.graphics = graphics;
 			self.width = width;
 			self.height = height;
+			match &mut self.compositor {
+				Some(compositor) => compositor.resize(width, height),
+				None if !self.bits.is_null() && glass_window(hwnd) => {
+					self.compositor = Compositor::new(hwnd, width, height);
+				}
+				None => {}
+			}
 		}
 	}
 
@@ -429,6 +461,21 @@ impl Canvas {
 	}
 
 	pub fn present(&self, hwnd: HWND) {
+		if let Some(compositor) = &self.compositor {
+			if self.bits.is_null() {
+				return;
+			}
+			// GDI 在 alpha 字节上留 0；交换链按预乘解释，整片补成不透明，
+			// 窗口的半透明统一由合成视觉的透明度给。
+			let pixels = self.bits.cast::<u32>();
+			unsafe {
+				for i in 0..(self.width * self.height) as usize {
+					*pixels.add(i) |= 0xFF00_0000;
+				}
+			}
+			compositor.present(self.bits);
+			return;
+		}
 		unsafe {
 			let screen = GetDC(hwnd);
 			if !screen.is_null() {
@@ -446,6 +493,14 @@ impl Canvas {
 				ReleaseDC(hwnd, screen);
 			}
 		}
+	}
+}
+
+/// Whether the window was created without a redirection surface, i.e. the
+/// canvas frame must go through DirectComposition.
+fn glass_window(hwnd: HWND) -> bool {
+	unsafe {
+		GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_NOREDIRECTIONBITMAP != 0
 	}
 }
 

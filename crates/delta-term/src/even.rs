@@ -1188,7 +1188,7 @@ impl GroupPane {
 		});
 	}
 
-	pub fn render(&self, canvas: &Canvas, area: Rect, focused: bool) {
+	pub fn render(&self, canvas: &Canvas, area: Rect, focused: bool, show_whitespace: bool) {
 		let cw = canvas.cell_w;
 		let ch = canvas.cell_h;
 		let cols = (area.width() / cw).max(1) as usize;
@@ -1223,6 +1223,25 @@ impl GroupPane {
 			canvas::DEFAULT_FG.2,
 		);
 		let y0 = area.top;
+		// The reference editor's space marker. The transcript rows are wrapped,
+		// not real line breaks, so only spaces are marked here.
+		let dots = |x0: i32, y: i32, text: &str| {
+			if !show_whitespace {
+				return;
+			}
+			let mut cell = 0usize;
+			for c in text.chars() {
+				if c == ' ' {
+					let dx = x0 + cell as i32 * cw + cw / 2 - 1;
+					let dy = y + ch * 62 / 100;
+					canvas.fill(dx, dy, dx + 2, dy + 2, canvas::rgb(78, 82, 106));
+				}
+				cell += c.width().unwrap_or(1);
+				if cell >= cols {
+					break;
+				}
+			}
+		};
 		canvas.text(
 			area.left,
 			y0,
@@ -1300,7 +1319,9 @@ impl GroupPane {
 					);
 				}
 			}
-			canvas.text(area.left, y, &truncate(line, cols), *color);
+			let shown = truncate(line, cols);
+			canvas.text(area.left, y, &shown, *color);
+			dots(area.left, y, &shown);
 		}
 		if group.scroll > 0 {
 			canvas.text(
@@ -1338,7 +1359,9 @@ impl GroupPane {
 			}
 		}
 		let shown: String = group.input[start_idx..].iter().collect();
-		canvas.text(area.left + 2 * cw, input_y, &truncate(&shown, avail), plain);
+		let shown = truncate(&shown, avail);
+		canvas.text(area.left + 2 * cw, input_y, &shown, plain);
+		dots(area.left + 2 * cw, input_y, &shown);
 		if focused {
 			let x = area.left + ((2 + col.min(avail)) as i32) * cw;
 			if x < area.left + cols as i32 * cw {

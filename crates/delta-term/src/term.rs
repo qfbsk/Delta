@@ -306,6 +306,7 @@ impl TerminalPane {
 		focused: bool,
 		show_cursor: bool,
 		pane_number: Option<u32>,
+		show_whitespace: bool,
 	) {
 		let cw = canvas.cell_w;
 		let ch = canvas.cell_h;
@@ -414,6 +415,16 @@ impl TerminalPane {
 						text.push(cell.comb);
 					}
 					canvas.text(area.left + col as i32 * cw, y, &text, fg_color);
+				} else if show_whitespace
+					&& cell.wide == 0
+					&& !(show_cursor && focused && !self.exited && abs == cursor_abs && col == cc)
+				{
+					// The reference editor's space marker: a small square
+					// below the cell's centre. A terminal has no line breaks
+					// to mark; rows are the lines.
+					let dx = area.left + col as i32 * cw + cw / 2 - 1;
+					let dy = y + ch * 62 / 100;
+					canvas.fill(dx, dy, dx + 2, dy + 2, canvas::rgb(78, 82, 106));
 				}
 				if cell.attrs & (delta_vt::ATTR_UNDERLINE | delta_vt::ATTR_DOUBLE_UNDERLINE) != 0 {
 					canvas.line(

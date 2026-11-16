@@ -4,9 +4,12 @@
 mod app;
 mod canvas;
 mod clipboard;
+mod compose;
 mod even;
 mod input;
+mod langconf;
 mod layout;
+mod lsp;
 mod mcp;
 mod opencode;
 mod pty;
